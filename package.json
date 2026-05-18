@@ -1,0 +1,35 @@
+{
+  "name": "convert-url-tool",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local job-based URL to MP4/MP3 converter using yt-dlp, ffmpeg, and a polished web UI.",
+  "scripts": {
+    "start": "npm run dev",
+    "dev": "node scripts/dev.mjs",
+    "build": "tsc -b && vite build",
+    "build:client": "tsc -b tsconfig.client.json && vite build",
+    "build:server": "tsc -b tsconfig.server.json",
+    "preview": "node dist/server/server/server.js",
+    "check": "tsc -b --pretty false"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "lucide-react": "^1.16.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "tsx": "^4.22.1",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3"
+  }
+}

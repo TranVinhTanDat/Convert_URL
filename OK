@@ -1,0 +1,13 @@
+
+> convert-url-tool@3.0.0 build:client
+> tsc -b tsconfig.client.json && vite build -
+
+[36mvite v6.4.2 [32mbuilding for production...[36m[39m
+transforming...
+[32m✓[39m 1752 modules transformed.
+rendering chunks...
+computing gzip size...
+[2mdist/client/[22m[32mindex.html                 [39m[1m[2m  0.45 kB[22m[1m[22m[2m │ gzip:  0.29 kB[22m
+[2mdist/client/[22m[35massets/index-BocHxeJx.css  [39m[1m[2m  6.71 kB[22m[1m[22m[2m │ gzip:  2.26 kB[22m
+[2mdist/client/[22m[36massets/index-J2WSWwaY.js   [39m[1m[2m207.44 kB[22m[1m[22m[2m │ gzip: 65.17 kB[22m
+[32m✓ built in 3.06s[39m
