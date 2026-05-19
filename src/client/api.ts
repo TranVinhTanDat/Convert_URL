@@ -1,4 +1,4 @@
-import type { ConvertJob, CreateJobPayload, HealthResponse } from './types';
+import type { ConvertJob, CreateJobPayload, FileConversionResult, FileToolId, HealthResponse } from './types';
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
@@ -45,4 +45,15 @@ export function createJob(payload: CreateJobPayload): Promise<ConvertJob> {
 
 export function getJob(jobId: string): Promise<ConvertJob> {
   return request<ConvertJob>(`/api/jobs/${jobId}`);
+}
+
+export function convertFile(tool: FileToolId, file: File): Promise<FileConversionResult> {
+  const body = new FormData();
+  body.append('tool', tool);
+  body.append('file', file);
+
+  return request<FileConversionResult>('/api/file-jobs', {
+    method: 'POST',
+    body
+  });
 }

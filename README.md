@@ -1,3 +1,12 @@
+---
+title: Convert URL Studio API
+emoji: 🎬
+colorFrom: teal
+colorTo: red
+sdk: docker
+app_port: 8080
+---
+
 # Convert URL Studio
 
 Ứng dụng chuyển URL video được phép sử dụng sang MP4 hoặc MP3.
@@ -5,8 +14,20 @@
 ## Stack
 
 - Frontend: React, TypeScript, Vite, lucide-react.
-- Backend: Node.js TypeScript, yt-dlp, ffmpeg, ffprobe.
-- Deploy đề xuất miễn phí: Vercel cho frontend, Koyeb hoặc Render Free cho backend Docker.
+- Backend: Node.js TypeScript, yt-dlp, ffmpeg, ffprobe, ExcelJS, fast-xml-parser, LibreOffice.
+- Deploy miễn phí đề xuất lúc này: Vercel cho frontend, Hugging Face Spaces Docker cho backend.
+
+## Tiện ích hiện có
+
+- URL video sang MP4/MP3.
+- Excel sang JSON.
+- JSON sang Excel.
+- Excel sang XML.
+- XML sang Excel.
+- Excel sang CSV.
+- CSV sang Excel.
+- Word sang PDF.
+- PDF sang Word thử nghiệm, chất lượng phụ thuộc PDF gốc.
 
 ## Chạy local
 
@@ -20,57 +41,54 @@ Mở:
 http://localhost:5173
 ```
 
-## Deploy miễn phí: Vercel + backend free
+## Vì sao không dùng Koyeb?
 
-### 1. Deploy backend free trước
+Koyeb đang bắt verify credit card/pro plan với tài khoản của bạn, nên không nên nhập thẻ nếu mục tiêu là miễn phí hoàn toàn.
 
-Backend cần chạy Docker vì phải có `yt-dlp`, `ffmpeg`, `ffprobe`.
+## Backend miễn phí: Hugging Face Spaces Docker
 
-#### Option A: Koyeb Free
+Hugging Face Spaces hỗ trợ Docker Spaces. Docker Space dùng `app_port` trong README YAML; repo này đã set:
 
-Koyeb Free Instance hiện cho 1 web service miễn phí với 512 MB RAM, 0.1 vCPU, 2 GB SSD, scale to zero khi không có traffic. Phù hợp demo/hobby, không phù hợp production nặng.
-
-Các bước:
-
-1. Push repo lên GitHub.
-2. Vào Koyeb, tạo Web Service mới từ GitHub repo.
-3. Chọn deploy bằng Dockerfile.
-4. Port dùng:
-
-```text
-8080
-```
-
-5. Sau khi deploy xong, copy backend URL dạng:
-
-```text
-https://your-app.koyeb.app
-```
-
-#### Option B: Render Free
-
-Render Free Web Service cũng deploy được Docker, nhưng filesystem là ephemeral và service free có giới hạn. Phù hợp demo/hobby.
-
-Repo đã có:
-
-```text
-render.yaml
-Dockerfile
+```yaml
+sdk: docker
+app_port: 8080
 ```
 
 Các bước:
 
-1. Push repo lên GitHub.
-2. Vào Render, tạo Web Service từ repo.
-3. Chọn Docker.
-4. Plan chọn Free.
-5. Sau khi deploy xong, copy backend URL dạng:
+1. Tạo tài khoản Hugging Face.
+2. Vào:
 
 ```text
-https://your-app.onrender.com
+https://huggingface.co/new-space
 ```
 
-### 2. Deploy frontend lên Vercel Free
+3. Chọn:
+
+```text
+SDK: Docker
+Visibility: Public
+Hardware: CPU basic/free
+```
+
+4. Tạo Space.
+5. Upload/push toàn bộ source này lên Space repo, hoặc connect/import từ GitHub nếu tài khoản của bạn có lựa chọn đó.
+6. Chờ Space build Dockerfile.
+7. Khi chạy xong, backend URL thường có dạng:
+
+```text
+https://username-space-name.hf.space
+```
+
+8. Test:
+
+```text
+https://username-space-name.hf.space/api/health
+```
+
+Nếu thấy JSON `ready: true` là backend đã OK.
+
+## Frontend miễn phí: Vercel
 
 Repo đã có:
 
@@ -97,42 +115,40 @@ Các bước:
 3. Thêm:
 
 ```text
-VITE_API_BASE_URL=https://your-backend-domain.com
-```
-
-Ví dụ:
-
-```text
-VITE_API_BASE_URL=https://your-app.koyeb.app
+VITE_API_BASE_URL=https://username-space-name.hf.space
 ```
 
 4. Deploy lại frontend.
 
-## Giới hạn của free backend
+## CORS
 
-Free backend có thể chạy được demo, nhưng cần hiểu rõ:
+Backend đã hỗ trợ CORS qua biến:
 
-- Convert video dùng CPU/RAM nhiều, free instance sẽ chậm.
-- Service có thể sleep khi không có traffic.
-- File output trên Render/Koyeb free không nên xem là lưu trữ bền vững.
-- Video dài hoặc chất lượng cao có thể fail do timeout/tài nguyên.
+```text
+CORS_ORIGIN=*
+```
 
-Nếu muốn chạy ổn định thật, nên dùng VPS nhỏ hoặc backend trả phí.
+Khi production nghiêm túc hơn, đổi thành domain Vercel của bạn:
+
+```text
+CORS_ORIGIN=https://your-project.vercel.app
+```
+
+## Giới hạn free backend
+
+Free backend phù hợp demo/hobby, không đảm bảo xử lý video dài:
+
+- CPU free có thể chậm.
+- Space có thể sleep/rebuild.
+- File output không nên xem là lưu trữ bền vững.
+- Video dài/chất lượng cao có thể fail vì tài nguyên.
+- Word/PDF cần LibreOffice trong Docker. Sau khi thay Dockerfile, cần redeploy backend để có `soffice`.
 
 ## Build local
 
 ```powershell
 npm run check
 npm run build
-```
-
-## Công cụ backend cần có nếu chạy không dùng Docker
-
-```powershell
-node --version
-yt-dlp --version
-ffmpeg -version
-ffprobe -version
 ```
 
 ## Lưu ý

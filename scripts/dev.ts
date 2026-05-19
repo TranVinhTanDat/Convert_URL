@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { appConfig } from '../src/shared/app-config.ts';
+import { appConfig } from '../src/shared/app-config';
 
 const isWindows = process.platform === 'win32';
 

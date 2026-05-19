@@ -6,7 +6,7 @@
   "description": "Local job-based URL to MP4/MP3 converter using yt-dlp, ffmpeg, and a polished web UI.",
   "scripts": {
     "start": "npm run dev",
-    "dev": "node scripts/dev.mjs",
+    "dev": "tsx scripts/dev.ts",
     "build": "tsc -b && vite build",
     "build:client": "tsc -b tsconfig.client.json && vite build",
     "build:server": "tsc -b tsconfig.server.json",
@@ -18,16 +18,24 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.7.0",
+    "busboy": "^1.6.0",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
+    "docx": "^9.6.1",
+    "exceljs": "^4.4.0",
+    "fast-xml-parser": "^5.8.0",
     "lucide-react": "^1.16.0",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^2.4.5",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
+    "sharp": "^0.34.5",
     "tsx": "^4.22.1",
     "typescript": "^6.0.3",
     "vite": "^6.4.2"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.4",
     "@types/node": "^25.8.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3"
