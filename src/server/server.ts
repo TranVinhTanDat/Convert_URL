@@ -113,13 +113,17 @@ interface RunOptions {
   timeoutMs?: number;
 }
 
+interface CommandRunner {
+  command: string;
+  argsPrefix: string[];
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = process.cwd();
 const PORT = Number(process.env.PORT || appConfig.apiPort);
 const DIST_CLIENT_DIR = path.join(ROOT, appConfig.paths.clientDist);
 const DOWNLOAD_DIR = path.join(ROOT, appConfig.paths.downloads);
-const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const SOFFICE = resolveLibreOfficeCommand();
 const MAX_BODY_SIZE = 128 * 1024;
 const MAX_UPLOAD_SIZE = 40 * 1024 * 1024;
@@ -128,6 +132,7 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 const jobs = new Map<string, ConvertJob>();
+let cachedYtdlpRunner: CommandRunner | null = null;
 
 const mimeTypes: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -291,6 +296,36 @@ function run(command: string, args: string[], options: RunOptions = {}): Promise
 async function hasCommand(command: string, args: string[], timeoutMs = 8000) {
   try {
     await run(command, args, { timeoutMs });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveYtdlpRunner() {
+  if (cachedYtdlpRunner) return cachedYtdlpRunner;
+
+  const candidates: CommandRunner[] = process.env.YTDLP_PATH
+    ? [{ command: process.env.YTDLP_PATH, argsPrefix: [] }]
+    : [
+      { command: 'yt-dlp', argsPrefix: [] },
+      { command: 'python3', argsPrefix: ['-m', 'yt_dlp'] },
+      { command: 'python', argsPrefix: ['-m', 'yt_dlp'] }
+    ];
+
+  for (const candidate of candidates) {
+    if (await hasCommand(candidate.command, [...candidate.argsPrefix, '--version'], 7000)) {
+      cachedYtdlpRunner = candidate;
+      return candidate;
+    }
+  }
+
+  throw new Error('yt-dlp is not available. Install yt-dlp or set YTDLP_PATH.');
+}
+
+async function hasYtdlp() {
+  try {
+    await resolveYtdlpRunner();
     return true;
   } catch {
     return false;
@@ -1289,8 +1324,9 @@ async function processJob(job: ConvertJob) {
       job.options.url
     ];
 
+    const ytdlpRunner = await resolveYtdlpRunner();
     updateJob(job, { progress: 10, step: 'Starting yt-dlp' });
-    await run(YTDLP, args, {
+    await run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], {
       onStdout: (text) => parseYtdlpProgress(job, text),
       onStderr: (text) => parseYtdlpProgress(job, text)
     });
@@ -1388,7 +1424,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
       const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady] = await Promise.all([
-        hasCommand(YTDLP, ['--version'], 5000),
+        hasYtdlp(),
         hasCommand('ffmpeg', ['-version'], 5000),
         hasCommand('ffprobe', ['-version'], 5000),
         hasCommand(SOFFICE, libreOfficeHealthArgs(), 12000),
