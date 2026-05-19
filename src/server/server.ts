@@ -115,7 +115,7 @@ interface RunOptions {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const ROOT = path.resolve(__dirname, '../..');
+const ROOT = process.cwd();
 const PORT = Number(process.env.PORT || appConfig.apiPort);
 const DIST_CLIENT_DIR = path.join(ROOT, appConfig.paths.clientDist);
 const DOWNLOAD_DIR = path.join(ROOT, appConfig.paths.downloads);
