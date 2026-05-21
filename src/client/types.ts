@@ -1,5 +1,6 @@
 export type OutputFormat = 'mp4' | 'mp3';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
+export type NewsVideoStatus = 'pending_approval' | 'ready_for_auto_publish';
 
 export interface HealthResponse {
   ready: boolean;
@@ -8,6 +9,7 @@ export interface HealthResponse {
   ffprobeReady: boolean;
   libreOfficeReady: boolean;
   pdf2docxReady: boolean;
+  rembgReady: boolean;
   openAIReady: boolean;
   nodeVersion: string;
   message: string;
@@ -62,12 +64,124 @@ export type FileToolId =
   | 'square-thumbnail'
   | 'strip-metadata'
   | 'image-metadata'
-  | 'scan-document';
+  | 'scan-document'
+  | 'remove-background'
+  | 'chroma-key'
+  | 'crop-image'
+  | 'rotate-image'
+  | 'filter-image'
+  | 'merge-pdf'
+  | 'split-pdf';
+
+export interface FileConversionItem {
+  input: string;
+  files?: ConvertFile[];
+  error?: string;
+}
 
 export interface FileConversionResult {
   id: string;
-  status: 'completed';
+  status: 'completed' | 'partial';
   tool: FileToolId;
   input: string;
+  items: FileConversionItem[];
+  files: ConvertFile[];
+}
+
+export interface PreviewSheet {
+  name: string;
+  headers: string[];
+  totalRows: number;
+  rows: string[][];
+}
+
+export type PreviewPayload =
+  | { kind: 'workbook'; sheets: PreviewSheet[] }
+  | { kind: 'text'; text: string }
+  | { kind: 'unsupported' };
+
+export type ArticleStatus =
+  | 'discovered'
+  | 'extracting'
+  | 'extract_failed'
+  | 'script_ready'
+  | 'generating'
+  | 'ready'
+  | 'approved'
+  | 'rejected';
+
+export interface NewsArticle {
+  id: string;
+  source: string;
+  sourceUrl: string;
+  title: string;
+  excerpt: string;
+  publishedAt: string;
+  fetchedAt: string;
+  updatedAt: string;
+  heroImage: string | null;
+  category: string | null;
+  bodyParagraphs: number;
+  body: string[];
+  bodyImages: string[];
+  script: string | null;
+  videoFile: string | null;
+  audioFile: string | null;
+  voiceLabel: string | null;
+  status: ArticleStatus;
+  error: string | null;
+}
+
+export interface NewsFeedResponse {
+  articles: NewsArticle[];
+  lastRefreshAt: string | null;
+  total: number;
+}
+
+export interface NewsRefreshResponse {
+  added: number;
+  updated: number;
+  total: number;
+  lastRefreshAt: string;
+}
+
+export interface NewsVideoRequest {
+  url: string;
+  format: 'short' | 'landscape';
+  language: 'vi' | 'en';
+  tone: 'newsroom' | 'social' | 'executive';
+  autoPublish: boolean;
+}
+
+export interface NewsArticle {
+  url: string;
+  host: string;
+  title: string;
+  description: string;
+  siteName: string;
+  author: string;
+  publishedAt: string;
+  imageUrl: string;
+  paragraphs: string[];
+}
+
+export interface StorySlide {
+  label: string;
+  headline: string;
+  body: string[];
+}
+
+export interface NewsVideoResult {
+  id: string;
+  status: NewsVideoStatus;
+  article: NewsArticle;
+  keyPoints: string[];
+  slides: StorySlide[];
+  script: string;
+  publishPlan: {
+    youtube: string;
+    tiktok: string;
+    sheet: string;
+  };
   files: ConvertFile[];
 }

@@ -12,6 +12,7 @@ import { PDFDocument } from 'pdf-lib';
 import { PDFParse } from 'pdf-parse';
 import sharp from 'sharp';
 import { appConfig, getApiOrigin } from '../shared/app-config.js';
+import { getNewsStore, publicArticle, refreshNewsFeed, reenrichArticle } from './content-studio/index.js';
 
 type OutputFormat = 'mp4' | 'mp3';
 type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
@@ -36,7 +37,14 @@ type FileTool =
   | 'square-thumbnail'
   | 'strip-metadata'
   | 'image-metadata'
-  | 'scan-document';
+  | 'scan-document'
+  | 'remove-background'
+  | 'chroma-key'
+  | 'crop-image'
+  | 'rotate-image'
+  | 'filter-image'
+  | 'merge-pdf'
+  | 'split-pdf';
 
 const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.avif'];
 
@@ -61,7 +69,14 @@ const fileToolExtensions: Record<FileTool, string[]> = {
   'square-thumbnail': imageExtensions,
   'strip-metadata': imageExtensions,
   'image-metadata': imageExtensions,
-  'scan-document': imageExtensions
+  'scan-document': imageExtensions,
+  'remove-background': imageExtensions,
+  'chroma-key': imageExtensions,
+  'crop-image': imageExtensions,
+  'rotate-image': imageExtensions,
+  'filter-image': imageExtensions,
+  'merge-pdf': ['.pdf'],
+  'split-pdf': ['.pdf']
 };
 
 function isFileTool(value: string): value is FileTool {
@@ -105,6 +120,32 @@ interface LocalFile {
   isFile: boolean;
 }
 
+interface NewsVideoRequest {
+  url: string;
+  format: 'short' | 'landscape';
+  language: 'vi' | 'en';
+  tone: 'newsroom' | 'social' | 'executive';
+  autoPublish: boolean;
+}
+
+interface NewsArticle {
+  url: string;
+  host: string;
+  title: string;
+  description: string;
+  siteName: string;
+  author: string;
+  publishedAt: string;
+  imageUrl: string;
+  paragraphs: string[];
+}
+
+interface StorySlide {
+  label: string;
+  headline: string;
+  body: string[];
+}
+
 interface RunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -130,6 +171,11 @@ const MAX_UPLOAD_SIZE = 40 * 1024 * 1024;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+const NEWS_STORE_DIR = path.join(ROOT, 'data', 'content-studio');
+const NEWS_STORE_FILE = path.join(NEWS_STORE_DIR, 'news.json');
+fs.mkdirSync(NEWS_STORE_DIR, { recursive: true });
+const newsStore = getNewsStore(NEWS_STORE_FILE);
 
 const jobs = new Map<string, ConvertJob>();
 let cachedYtdlpRunner: CommandRunner | null = null;
@@ -370,7 +416,27 @@ function fileToDownload(id: string, fullPath: string): JobFile {
   };
 }
 
-function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTool; filePath: string; originalName: string; jobDir: string; id: string }> {
+interface UploadedFile {
+  filePath: string;
+  originalName: string;
+}
+
+const MAX_BATCH_FILES = 20;
+
+function uniquePathInDir(jobDir: string, name: string): string {
+  const parsed = path.parse(name);
+  let candidate = path.join(jobDir, name);
+  let counter = 1;
+  while (fs.existsSync(candidate)) {
+    counter += 1;
+    candidate = path.join(jobDir, `${parsed.name} (${counter})${parsed.ext}`);
+  }
+  return candidate;
+}
+
+export type ToolOptions = Record<string, string | number | boolean>;
+
+function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTool; files: UploadedFile[]; options: ToolOptions; jobDir: string; id: string }> {
   return new Promise((resolve, reject) => {
     const contentType = req.headers['content-type'];
     if (!contentType?.includes('multipart/form-data')) {
@@ -379,35 +445,50 @@ function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTo
     }
 
     const { id, jobDir } = createUtilityDir();
-    const busboy = Busboy({ headers: req.headers, defParamCharset: 'utf8', limits: { files: 1, fileSize: MAX_UPLOAD_SIZE, fields: 4 } });
+    const busboy = Busboy({ headers: req.headers, defParamCharset: 'utf8', limits: { files: MAX_BATCH_FILES, fileSize: MAX_UPLOAD_SIZE, fields: 32 } });
     let tool = '' as FileTool;
-    let filePath = '';
-    let originalName = '';
+    const files: UploadedFile[] = [];
+    let options: ToolOptions = {};
     let uploadError: Error | null = null;
     const writePromises: Promise<void>[] = [];
 
     busboy.on('field', (name, value) => {
       if (name === 'tool') {
         tool = value as FileTool;
+      } else if (name === 'options') {
+        try {
+          const parsed = JSON.parse(value);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            options = parsed as ToolOptions;
+          }
+        } catch {
+          // ignore malformed options blob
+        }
       }
     });
 
     busboy.on('file', (_name, file, info) => {
-      originalName = safeFileName(normalizeUploadName(info.filename || 'upload'));
-      filePath = path.join(jobDir, originalName);
+      const originalName = safeFileName(normalizeUploadName(info.filename || 'upload'));
+      const filePath = uniquePathInDir(jobDir, originalName);
+      const finalName = path.basename(filePath);
       const writer = fs.createWriteStream(filePath);
-      writePromises.push(new Promise((resolve, rejectWrite) => {
-        writer.on('finish', resolve);
+      files.push({ filePath, originalName: finalName });
+      writePromises.push(new Promise((resolveWrite, rejectWrite) => {
+        writer.on('finish', resolveWrite);
         writer.on('error', rejectWrite);
       }));
 
       file.on('limit', () => {
-        uploadError = new Error('File is too large. Maximum upload size is 40 MB.');
+        uploadError = new Error(`File "${originalName}" too large. Maximum 40 MB per file.`);
         file.unpipe(writer);
         writer.destroy();
       });
 
       file.pipe(writer);
+    });
+
+    busboy.on('filesLimit', () => {
+      uploadError = new Error(`Too many files. Maximum ${MAX_BATCH_FILES} per batch.`);
     });
 
     busboy.on('error', reject);
@@ -432,69 +513,358 @@ function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTo
         return;
       }
 
-      if (!filePath || !fs.existsSync(filePath)) {
+      if (!files.length) {
         fs.rmSync(jobDir, { recursive: true, force: true });
-        reject(new Error('Upload must include a conversion tool and one file.'));
+        reject(new Error('Upload must include at least one file.'));
         return;
       }
 
-      const extension = path.extname(filePath).toLowerCase();
-      if (!fileToolExtensions[tool].includes(extension)) {
+      const allowed = fileToolExtensions[tool];
+      const invalid = files.find((file) => !allowed.includes(path.extname(file.filePath).toLowerCase()));
+      if (invalid) {
         fs.rmSync(jobDir, { recursive: true, force: true });
-        reject(new Error(`File .${extension.replace('.', '') || 'unknown'} is not valid for this tool. Accepted: ${fileToolExtensions[tool].join(', ')}.`));
+        const extension = path.extname(invalid.filePath).toLowerCase().replace('.', '') || 'unknown';
+        reject(new Error(`File "${invalid.originalName}" (.${extension}) is not valid for this tool. Accepted: ${allowed.join(', ')}.`));
         return;
       }
 
-      resolve({ tool, filePath, originalName, jobDir, id });
+      resolve({ tool, files, options, jobDir, id });
     });
 
     req.pipe(busboy);
   });
 }
 
-function worksheetToRows(worksheet: ExcelJS.Worksheet) {
-  const headerRow = worksheet.getRow(1);
-  const headers = headerRow.values instanceof Array
-    ? headerRow.values.slice(1).map((value, index) => String(value || `Column ${index + 1}`))
-    : [];
-  const rows: Record<string, unknown>[] = [];
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(num)));
+}
 
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const entry: Record<string, unknown> = {};
-    headers.forEach((header, index) => {
-      const value = row.getCell(index + 1).value;
-      entry[header] = typeof value === 'object' && value !== null && 'text' in value ? String(value.text) : value;
+function clampFloat(value: unknown, fallback: number, min: number, max: number): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, num));
+}
+
+function pickString<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return (allowed as readonly string[]).includes(String(value)) ? value as T : fallback;
+}
+
+interface ZipEntry {
+  name: string;
+  data: Buffer;
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buffer.length; i++) {
+    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ buffer[i]) & 0xff];
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildZip(entries: ZipEntry[]): Buffer {
+  // Stored (uncompressed) ZIP — outputs are already compressed media types
+  const localBlocks: Buffer[] = [];
+  const centralBlocks: Buffer[] = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBuffer = Buffer.from(entry.name, 'utf8');
+    const crc = crc32(entry.data);
+    const size = entry.data.length;
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4); // version needed
+    localHeader.writeUInt16LE(0x0800, 6); // flags: UTF-8 names
+    localHeader.writeUInt16LE(0, 8); // method: store
+    localHeader.writeUInt16LE(0, 10); // mod time
+    localHeader.writeUInt16LE(0x21, 12); // mod date (1980-01-01)
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(size, 18); // compressed size
+    localHeader.writeUInt32LE(size, 22); // uncompressed size
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28); // extra length
+
+    localBlocks.push(localHeader, nameBuffer, entry.data);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4); // version made by
+    centralHeader.writeUInt16LE(20, 6); // version needed
+    centralHeader.writeUInt16LE(0x0800, 8); // flags
+    centralHeader.writeUInt16LE(0, 10); // method
+    centralHeader.writeUInt16LE(0, 12); // mod time
+    centralHeader.writeUInt16LE(0x21, 14); // mod date
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(size, 20);
+    centralHeader.writeUInt32LE(size, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30); // extra length
+    centralHeader.writeUInt16LE(0, 32); // comment length
+    centralHeader.writeUInt16LE(0, 34); // disk number
+    centralHeader.writeUInt16LE(0, 36); // internal attributes
+    centralHeader.writeUInt32LE(0, 38); // external attributes
+    centralHeader.writeUInt32LE(offset, 42);
+
+    centralBlocks.push(centralHeader, nameBuffer);
+
+    offset += localHeader.length + nameBuffer.length + entry.data.length;
+  }
+
+  const centralStart = offset;
+  let centralSize = 0;
+  for (const block of centralBlocks) centralSize += block.length;
+
+  const endRecord = Buffer.alloc(22);
+  endRecord.writeUInt32LE(0x06054b50, 0);
+  endRecord.writeUInt16LE(0, 4); // disk
+  endRecord.writeUInt16LE(0, 6);
+  endRecord.writeUInt16LE(entries.length, 8);
+  endRecord.writeUInt16LE(entries.length, 10);
+  endRecord.writeUInt32LE(centralSize, 12);
+  endRecord.writeUInt32LE(centralStart, 16);
+  endRecord.writeUInt16LE(0, 20); // comment length
+
+  return Buffer.concat([...localBlocks, ...centralBlocks, endRecord]);
+}
+
+function extractCellValue(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value;
+  if (typeof value !== 'object') return value;
+
+  const obj = value as Record<string, unknown>;
+
+  if ('richText' in obj && Array.isArray(obj.richText)) {
+    return obj.richText.map((part: unknown) => {
+      const node = part as { text?: unknown } | null;
+      return node && typeof node === 'object' && node.text != null ? String(node.text) : '';
+    }).join('');
+  }
+
+  if ('hyperlink' in obj) {
+    return obj.text !== undefined && obj.text !== null ? String(obj.text) : String(obj.hyperlink);
+  }
+
+  if ('formula' in obj || 'sharedFormula' in obj) {
+    return obj.result !== undefined ? extractCellValue(obj.result) : null;
+  }
+
+  if ('error' in obj) {
+    return `#ERR ${String(obj.error)}`;
+  }
+
+  if ('text' in obj) {
+    return String(obj.text);
+  }
+
+  return value;
+}
+
+function jsonSafeValue(value: unknown): unknown {
+  if (value === undefined) return null;
+  if (value instanceof Date) return value.toISOString();
+  return value;
+}
+
+function extractWorksheet(worksheet: ExcelJS.Worksheet): { headers: string[]; rows: Record<string, unknown>[] } {
+  type RowSnapshot = { num: number; cells: Map<number, unknown> };
+  const allRows: RowSnapshot[] = [];
+  let maxColumn = 0;
+
+  worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    const cells = new Map<number, unknown>();
+    row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      if (cell.type === ExcelJS.ValueType.Merge) return;
+      const value = extractCellValue(cell.value);
+      if (value !== null && value !== '') {
+        cells.set(colNumber, value);
+        if (colNumber > maxColumn) maxColumn = colNumber;
+      }
     });
-    rows.push(entry);
+    if (cells.size > 0) allRows.push({ num: rowNumber, cells });
   });
 
-  return rows;
+  if (!allRows.length || maxColumn === 0) {
+    return { headers: [], rows: [] };
+  }
+
+  let headerIndex = 0;
+  let bestScore = -1;
+  const scanLimit = Math.min(20, allRows.length);
+  for (let i = 0; i < scanLimit; i++) {
+    const cells = allRows[i].cells;
+    let stringCount = 0;
+    for (const value of cells.values()) {
+      if (typeof value === 'string') stringCount += 1;
+    }
+    const score = cells.size * 2 + stringCount;
+    if (score > bestScore) {
+      bestScore = score;
+      headerIndex = i;
+    }
+  }
+
+  const headerCells = allRows[headerIndex].cells;
+  const rawHeaders: string[] = [];
+  for (let c = 1; c <= maxColumn; c++) {
+    const value = headerCells.get(c);
+    const stringValue = value == null ? '' : String(value).trim();
+    rawHeaders.push(stringValue || `Column ${c}`);
+  }
+
+  const seen = new Map<string, number>();
+  const headers = rawHeaders.map((header) => {
+    const count = seen.get(header) || 0;
+    seen.set(header, count + 1);
+    return count === 0 ? header : `${header} (${count + 1})`;
+  });
+
+  const rows: Record<string, unknown>[] = [];
+  for (let i = headerIndex + 1; i < allRows.length; i++) {
+    const { cells } = allRows[i];
+    const entry: Record<string, unknown> = {};
+    let hasValue = false;
+    for (let c = 1; c <= maxColumn; c++) {
+      const raw = cells.get(c);
+      const value = raw === undefined ? null : raw;
+      if (value !== null && value !== '') hasValue = true;
+      entry[headers[c - 1]] = value;
+    }
+    if (hasValue) rows.push(entry);
+  }
+
+  return { headers, rows };
+}
+
+function sanitizeXmlName(name: string, fallback: string): string {
+  if (!name) return fallback;
+
+  const normalized = name.normalize('NFC');
+  const allowedAscii = /[A-Za-z0-9_.\-]/;
+  const isLetterOrDigit = /[\p{L}\p{N}]/u;
+  let cleaned = '';
+
+  for (const ch of normalized) {
+    if (allowedAscii.test(ch) || (ch.charCodeAt(0) > 127 && isLetterOrDigit.test(ch))) {
+      cleaned += ch;
+    } else {
+      cleaned += '_';
+    }
+  }
+
+  cleaned = cleaned.replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  if (!cleaned) return fallback;
+
+  const first = cleaned.charAt(0);
+  if (first !== '_' && !/[A-Za-z]/.test(first) && !/\p{L}/u.test(first)) {
+    cleaned = `_${cleaned}`;
+  }
+
+  return cleaned;
+}
+
+function buildSafeHeaderMap(headers: string[]): Map<string, string> {
+  const map = new Map<string, string>();
+  const used = new Set<string>();
+  headers.forEach((header, index) => {
+    const fallback = `Field${index + 1}`;
+    const base = sanitizeXmlName(header, fallback);
+    let candidate = base;
+    let counter = 2;
+    while (used.has(candidate)) {
+      candidate = `${base}_${counter++}`;
+    }
+    used.add(candidate);
+    map.set(header, candidate);
+  });
+  return map;
+}
+
+function cellTextForXml(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
 }
 
 async function excelToJson(inputPath: string, outputPath: string) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(inputPath);
-  const sheets = workbook.worksheets.map((worksheet) => ({
-    name: worksheet.name,
-    rows: worksheetToRows(worksheet)
-  }));
+
+  const sheets = workbook.worksheets.map((worksheet) => {
+    const { headers, rows } = extractWorksheet(worksheet);
+    return {
+      name: worksheet.name,
+      headers,
+      rows: rows.map((row) => {
+        const out: Record<string, unknown> = {};
+        headers.forEach((header) => {
+          out[header] = jsonSafeValue(row[header] ?? null);
+        });
+        return out;
+      })
+    };
+  });
+
   fs.writeFileSync(outputPath, JSON.stringify({ sheets }, null, 2), 'utf8');
 }
 
 async function excelToXml(inputPath: string, outputPath: string) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(inputPath);
-  const builder = new XMLBuilder({ ignoreAttributes: false, format: true });
-  const xml = builder.build({
-    workbook: {
-      sheet: workbook.worksheets.map((worksheet) => ({
-        '@_name': worksheet.name,
-        row: worksheetToRows(worksheet)
-      }))
-    }
+
+  const sheets = workbook.worksheets.map((worksheet) => {
+    const { headers, rows } = extractWorksheet(worksheet);
+    const safeMap = buildSafeHeaderMap(headers);
+
+    return {
+      '@_name': worksheet.name,
+      row: rows.map((rowData) => {
+        const rowObj: Record<string, unknown> = {};
+        headers.forEach((header) => {
+          const safeName = safeMap.get(header) || sanitizeXmlName(header, 'Field');
+          rowObj[safeName] = {
+            '@_name': header,
+            '#text': cellTextForXml(rowData[header])
+          };
+        });
+        return rowObj;
+      })
+    };
   });
+
+  const builder = new XMLBuilder({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    format: true,
+    indentBy: '  ',
+    suppressEmptyNode: false,
+    processEntities: true,
+    textNodeName: '#text'
+  });
+
+  const xmlBody = builder.build({ workbook: { sheet: sheets } });
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n${xmlBody.trimStart()}`;
   fs.writeFileSync(outputPath, xml, 'utf8');
+}
+
+function csvEscape(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const str = value instanceof Date ? value.toISOString() : String(value);
+  return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
 }
 
 async function excelToCsv(inputPath: string, outputPath: string) {
@@ -502,7 +872,14 @@ async function excelToCsv(inputPath: string, outputPath: string) {
   await workbook.xlsx.readFile(inputPath);
   const worksheet = workbook.worksheets[0];
   if (!worksheet) throw new Error('Excel file does not contain any worksheet.');
-  await workbook.csv.writeFile(outputPath, { sheetName: worksheet.name });
+
+  const { headers, rows } = extractWorksheet(worksheet);
+  const lines: string[] = [];
+  lines.push(headers.map(csvEscape).join(','));
+  for (const row of rows) {
+    lines.push(headers.map((header) => csvEscape(row[header])).join(','));
+  }
+  fs.writeFileSync(outputPath, `﻿${lines.join('\r\n')}\r\n`, 'utf8');
 }
 
 function normalizeRowsFromJson(data: unknown): Array<{ name: string; rows: Record<string, unknown>[] }> {
@@ -542,6 +919,40 @@ async function jsonToExcel(inputPath: string, outputPath: string) {
   await rowsToExcel(normalizeRowsFromJson(data), outputPath);
 }
 
+function normalizeXmlCell(value: unknown): unknown {
+  if (value === null || value === undefined) return '';
+  if (typeof value !== 'object' || Array.isArray(value)) return value;
+
+  const obj = value as Record<string, unknown>;
+  if ('#text' in obj) return obj['#text'] ?? '';
+
+  const keys = Object.keys(obj).filter((key) => !key.startsWith('@_'));
+  if (keys.length === 0) return '';
+
+  return value;
+}
+
+function normalizeXmlRow(row: unknown): Record<string, unknown> {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return {};
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
+    if (key.startsWith('@_') || key === '#text') continue;
+
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const cell = value as Record<string, unknown>;
+      const originalName = typeof cell['@_name'] === 'string' && cell['@_name'].trim()
+        ? String(cell['@_name'])
+        : key;
+      result[originalName] = normalizeXmlCell(cell);
+    } else {
+      result[key] = value ?? '';
+    }
+  }
+
+  return result;
+}
+
 function findRowsInXml(value: unknown): Record<string, unknown>[] {
   if (Array.isArray(value) && value.every((item) => item && typeof item === 'object')) {
     return value as Record<string, unknown>[];
@@ -558,29 +969,42 @@ function findRowsInXml(value: unknown): Record<string, unknown>[] {
 }
 
 async function xmlToExcel(inputPath: string, outputPath: string) {
-  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' });
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    textNodeName: '#text',
+    parseAttributeValue: false,
+    trimValues: true,
+    ignoreDeclaration: true,
+    ignorePiTags: true
+  });
   const parsed = parser.parse(fs.readFileSync(inputPath, 'utf8')) as unknown;
   const workbookNode = (parsed as { workbook?: { sheet?: unknown } }).workbook;
 
   if (workbookNode?.sheet) {
-    const sheets = (Array.isArray(workbookNode.sheet) ? workbookNode.sheet : [workbookNode.sheet])
-      .map((sheet, index) => {
-        const sheetObject = sheet as { name?: string; row?: unknown };
-        return {
-          name: sheetObject.name || `Sheet${index + 1}`,
-          rows: Array.isArray(sheetObject.row)
-            ? sheetObject.row as Record<string, unknown>[]
-            : sheetObject.row
-              ? [sheetObject.row as Record<string, unknown>]
-              : []
-        };
-      });
+    const sheetArray = Array.isArray(workbookNode.sheet) ? workbookNode.sheet : [workbookNode.sheet];
+    const sheets = sheetArray.map((sheet, index) => {
+      const sheetObject = sheet as { '@_name'?: string; name?: string; row?: unknown };
+      const rowSource = sheetObject.row;
+      const rawRows = Array.isArray(rowSource)
+        ? rowSource
+        : rowSource
+          ? [rowSource]
+          : [];
+      return {
+        name: sheetObject['@_name'] || sheetObject.name || `Sheet${index + 1}`,
+        rows: rawRows.map((row) => normalizeXmlRow(row))
+      };
+    });
     await rowsToExcel(sheets, outputPath);
     return;
   }
 
   const rows = findRowsInXml(parsed);
-  await rowsToExcel([{ name: 'XML', rows: rows.length ? rows : [parsed as Record<string, unknown>] }], outputPath);
+  const normalized = rows.length
+    ? rows.map((row) => normalizeXmlRow(row))
+    : [normalizeXmlRow(parsed)];
+  await rowsToExcel([{ name: 'XML', rows: normalized }], outputPath);
 }
 
 async function csvToExcel(inputPath: string, outputPath: string) {
@@ -788,49 +1212,61 @@ function imagePipeline(inputPath: string) {
   return sharp(inputPath, { failOn: 'none' }).rotate();
 }
 
-async function convertImage(inputPath: string, outputPath: string, format: 'png' | 'jpeg' | 'webp' | 'avif') {
+async function convertImage(inputPath: string, outputPath: string, format: 'png' | 'jpeg' | 'webp' | 'avif', options: ToolOptions = {}) {
   const pipeline = imagePipeline(inputPath);
 
   if (format === 'png') {
-    await pipeline.png({ compressionLevel: 9, palette: false }).toFile(outputPath);
+    const compressionLevel = clampInt(options.compression, 9, 0, 9);
+    await pipeline.png({ compressionLevel, palette: false }).toFile(outputPath);
     return;
   }
 
   if (format === 'jpeg') {
-    await pipeline.jpeg({ quality: 88, mozjpeg: true }).toFile(outputPath);
+    const quality = clampInt(options.quality, 88, 30, 100);
+    await pipeline.jpeg({ quality, mozjpeg: true }).toFile(outputPath);
     return;
   }
 
   if (format === 'webp') {
-    await pipeline.webp({ quality: 86, effort: 5 }).toFile(outputPath);
+    const quality = clampInt(options.quality, 86, 30, 100);
+    const effort = clampInt(options.effort, 5, 0, 6);
+    await pipeline.webp({ quality, effort }).toFile(outputPath);
     return;
   }
 
-  await pipeline.avif({ quality: 62, effort: 7 }).toFile(outputPath);
+  const quality = clampInt(options.quality, 62, 30, 90);
+  const effort = clampInt(options.effort, 7, 0, 9);
+  await pipeline.avif({ quality, effort }).toFile(outputPath);
 }
 
-async function compressImage(inputPath: string, outputPath: string) {
+async function compressImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const quality = clampInt(options.quality, 78, 50, 95);
+  const maxDimension = clampInt(options.maxDimension, 2560, 600, 6000);
   await imagePipeline(inputPath)
-    .resize({ width: 2560, height: 2560, fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 78, mozjpeg: true })
+    .resize({ width: maxDimension, height: maxDimension, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality, mozjpeg: true })
     .toFile(outputPath);
 }
 
-async function resizeImage(inputPath: string, outputPath: string) {
+async function resizeImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const targetSize = clampInt(options.width, 1920, 200, 6000);
+  const quality = clampInt(options.quality, 84, 40, 100);
   await imagePipeline(inputPath)
-    .resize({ width: 1920, height: 1920, fit: 'inside', withoutEnlargement: true })
-    .webp({ quality: 84, effort: 5 })
+    .resize({ width: targetSize, height: targetSize, fit: 'inside', withoutEnlargement: true })
+    .webp({ quality, effort: 5 })
     .toFile(outputPath);
 }
 
-async function upscaleImage(inputPath: string, outputPath: string) {
+async function upscaleImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
   const metadata = await sharp(inputPath, { failOn: 'none' }).metadata();
   if (!metadata.width || !metadata.height) throw new Error('Cannot read image dimensions.');
 
+  const scaleLabel = pickString(options.scale, ['2x', '3x', '4x'] as const, '2x');
+  const scale = scaleLabel === '4x' ? 4 : scaleLabel === '3x' ? 3 : 2;
   await imagePipeline(inputPath)
     .resize({
-      width: Math.min(metadata.width * 2, 6000),
-      height: Math.min(metadata.height * 2, 6000),
+      width: Math.min(metadata.width * scale, 6000),
+      height: Math.min(metadata.height * scale, 6000),
       fit: 'inside',
       kernel: sharp.kernel.lanczos3
     })
@@ -839,10 +1275,15 @@ async function upscaleImage(inputPath: string, outputPath: string) {
     .toFile(outputPath);
 }
 
-async function squareThumbnail(inputPath: string, outputPath: string) {
+async function squareThumbnail(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const size = clampInt(options.size, 1200, 200, 2400);
+  const background = typeof options.background === 'string' && /^#[0-9a-f]{6}$/i.test(options.background)
+    ? options.background
+    : '#ffffff';
+  const quality = clampInt(options.quality, 86, 50, 100);
   await imagePipeline(inputPath)
-    .resize({ width: 1200, height: 1200, fit: 'contain', background: '#ffffff', withoutEnlargement: false })
-    .webp({ quality: 86, effort: 5 })
+    .resize({ width: size, height: size, fit: 'contain', background, withoutEnlargement: false })
+    .webp({ quality, effort: 5 })
     .toFile(outputPath);
 }
 
@@ -909,7 +1350,7 @@ async function imageToPdf(inputPath: string, outputPath: string) {
   fs.writeFileSync(outputPath, await pdf.save());
 }
 
-async function pdfToPng(inputPath: string, jobDir: string) {
+async function pdfToPng(inputPath: string, jobDir: string, options: ToolOptions = {}) {
   const parser = new PDFParse({
     data: new Uint8Array(fs.readFileSync(inputPath)),
     disableFontFace: true,
@@ -917,9 +1358,11 @@ async function pdfToPng(inputPath: string, jobDir: string) {
     isOffscreenCanvasSupported: false
   });
 
+  const desiredWidth = clampInt(options.width, 1800, 600, 3600);
+
   try {
     const screenshots = await parser.getScreenshot({
-      desiredWidth: 1800,
+      desiredWidth,
       imageBuffer: true,
       imageDataUrl: false
     });
@@ -949,7 +1392,371 @@ async function scanDocument(inputPath: string, outputPath: string) {
     .toFile(outputPath);
 }
 
-async function processFileConversion(tool: FileTool, inputPath: string, jobDir: string) {
+async function removeBackground(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const model = pickString(
+    options.model,
+    ['u2net', 'u2netp', 'silueta', 'isnet-general-use', 'isnet-anime'] as const,
+    'u2net'
+  );
+  const ready = await hasCommand('rembg', ['--version'], 8000);
+  if (!ready) {
+    throw new Error('Xóa nền cần rembg. Cài bằng: python -m pip install "rembg[cpu]"');
+  }
+  await run('rembg', ['i', '-m', model, inputPath, outputPath], { timeoutMs: 180000 });
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 100) {
+    throw new Error('rembg không tạo được file PNG sạch nền.');
+  }
+}
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!match) return null;
+  const num = parseInt(match[1], 16);
+  return { r: (num >> 16) & 0xff, g: (num >> 8) & 0xff, b: num & 0xff };
+}
+
+function detectCornerColor(data: Buffer, width: number, height: number): { r: number; g: number; b: number } {
+  // Average 4 corners (10x10 sample each)
+  const samples = [
+    [0, 0], [width - 10, 0], [0, height - 10], [width - 10, height - 10]
+  ];
+  let r = 0, g = 0, b = 0, n = 0;
+  for (const [sx, sy] of samples) {
+    for (let dy = 0; dy < 10; dy++) {
+      for (let dx = 0; dx < 10; dx++) {
+        const x = Math.min(width - 1, sx + dx);
+        const y = Math.min(height - 1, sy + dy);
+        const idx = (y * width + x) * 4;
+        r += data[idx];
+        g += data[idx + 1];
+        b += data[idx + 2];
+        n += 1;
+      }
+    }
+  }
+  return { r: Math.round(r / n), g: Math.round(g / n), b: Math.round(b / n) };
+}
+
+async function chromaKey(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const targetMode = pickString(options.target, ['auto', 'custom'] as const, 'auto');
+  const tolerance = clampInt(options.tolerance, 32, 0, 200);
+  const feather = clampInt(options.feather, 12, 0, 80);
+
+  const image = sharp(inputPath, { failOn: 'none' }).rotate().ensureAlpha();
+  const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
+  if (info.channels !== 4) {
+    throw new Error('Chroma key cần ảnh RGBA — thử lại với file ảnh chuẩn.');
+  }
+
+  const target = targetMode === 'custom'
+    ? hexToRgb(typeof options.color === 'string' ? options.color : '#000000')
+    : detectCornerColor(data, info.width, info.height);
+  if (!target) throw new Error('Mã màu HEX không hợp lệ (vd: #000000).');
+
+  const featherEnd = tolerance + feather;
+  const denom = Math.max(1, featherEnd - tolerance);
+  const pixels = info.width * info.height;
+  const buf = Buffer.from(data);
+
+  for (let i = 0; i < pixels; i++) {
+    const idx = i * 4;
+    const dr = buf[idx] - target.r;
+    const dg = buf[idx + 1] - target.g;
+    const db = buf[idx + 2] - target.b;
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+
+    if (dist <= tolerance) {
+      buf[idx + 3] = 0;
+    } else if (dist < featherEnd) {
+      const t = (dist - tolerance) / denom;
+      buf[idx + 3] = Math.round(buf[idx + 3] * t);
+    }
+  }
+
+  await sharp(buf, { raw: { width: info.width, height: info.height, channels: 4 } })
+    .png({ compressionLevel: 9 })
+    .toFile(outputPath);
+}
+
+async function cropImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const metadata = await sharp(inputPath, { failOn: 'none' }).metadata();
+  if (!metadata.width || !metadata.height) throw new Error('Cannot read image dimensions.');
+
+  const aspectPreset = pickString(
+    options.aspect,
+    ['custom', 'square', '4:3', '3:2', '16:9', '9:16', '3:4', '2:3'] as const,
+    'custom'
+  );
+
+  let cropWidth = metadata.width;
+  let cropHeight = metadata.height;
+
+  if (aspectPreset !== 'custom') {
+    const [w, h] = aspectPreset === 'square' ? [1, 1] : aspectPreset.split(':').map(Number);
+    const targetRatio = w / h;
+    const imageRatio = metadata.width / metadata.height;
+    if (imageRatio > targetRatio) {
+      cropHeight = metadata.height;
+      cropWidth = Math.round(metadata.height * targetRatio);
+    } else {
+      cropWidth = metadata.width;
+      cropHeight = Math.round(metadata.width / targetRatio);
+    }
+  } else {
+    cropWidth = clampInt(options.width, metadata.width, 1, metadata.width);
+    cropHeight = clampInt(options.height, metadata.height, 1, metadata.height);
+  }
+
+  const x = clampInt(options.x, Math.round((metadata.width - cropWidth) / 2), 0, metadata.width - cropWidth);
+  const y = clampInt(options.y, Math.round((metadata.height - cropHeight) / 2), 0, metadata.height - cropHeight);
+
+  await imagePipeline(inputPath)
+    .extract({ left: x, top: y, width: cropWidth, height: cropHeight })
+    .png({ compressionLevel: 9 })
+    .toFile(outputPath);
+}
+
+async function rotateImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const rotateDegrees = clampInt(options.rotate, 0, -360, 360);
+  const flipH = String(options.flipH) === 'true';
+  const flipV = String(options.flipV) === 'true';
+  const background = typeof options.background === 'string' && /^#[0-9a-f]{6}$/i.test(options.background)
+    ? options.background
+    : '#ffffff';
+
+  let pipeline = imagePipeline(inputPath);
+  if (rotateDegrees !== 0) {
+    pipeline = pipeline.rotate(rotateDegrees, { background });
+  }
+  if (flipH) pipeline = pipeline.flop();
+  if (flipV) pipeline = pipeline.flip();
+  await pipeline.png({ compressionLevel: 9 }).toFile(outputPath);
+}
+
+async function filterImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const mode = pickString(
+    options.filter,
+    ['grayscale', 'sepia', 'invert', 'blur', 'sharpen', 'brightness', 'cool', 'warm'] as const,
+    'grayscale'
+  );
+  const intensity = clampFloat(options.intensity, 1.0, 0.1, 3.0);
+
+  let pipeline = imagePipeline(inputPath);
+  switch (mode) {
+    case 'grayscale':
+      pipeline = pipeline.grayscale();
+      break;
+    case 'sepia':
+      pipeline = pipeline.recomb([
+        [0.393, 0.769, 0.189],
+        [0.349, 0.686, 0.168],
+        [0.272, 0.534, 0.131]
+      ]);
+      break;
+    case 'invert':
+      pipeline = pipeline.negate({ alpha: false });
+      break;
+    case 'blur':
+      pipeline = pipeline.blur(Math.max(0.3, intensity * 5));
+      break;
+    case 'sharpen':
+      pipeline = pipeline.sharpen({ sigma: 1.0 * intensity, m1: 1.0, m2: 2.0 });
+      break;
+    case 'brightness':
+      pipeline = pipeline.modulate({ brightness: intensity });
+      break;
+    case 'cool':
+      pipeline = pipeline.modulate({ saturation: 1.2 }).tint('#88aaff');
+      break;
+    case 'warm':
+      pipeline = pipeline.modulate({ saturation: 1.2 }).tint('#ffaa66');
+      break;
+  }
+  await pipeline.jpeg({ quality: 92, mozjpeg: true }).toFile(outputPath);
+}
+
+async function mergePdf(inputPaths: string[], outputPath: string) {
+  if (!inputPaths.length) throw new Error('Cần ít nhất 1 file PDF.');
+  const merged = await PDFDocument.create();
+  for (const inputPath of inputPaths) {
+    const bytes = fs.readFileSync(inputPath);
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const indices = doc.getPageIndices();
+    const pages = await merged.copyPages(doc, indices);
+    for (const page of pages) merged.addPage(page);
+  }
+  if (merged.getPageCount() === 0) throw new Error('PDF gộp ra rỗng — kiểm tra lại input.');
+  fs.writeFileSync(outputPath, await merged.save());
+}
+
+function parsePageRanges(spec: string, totalPages: number): number[][] {
+  const ranges: number[][] = [];
+  const trimmed = (spec || '').trim();
+  if (!trimmed || trimmed === 'all') {
+    return Array.from({ length: totalPages }, (_, i) => [i]);
+  }
+  for (const part of trimmed.split(',').map((p) => p.trim()).filter(Boolean)) {
+    const matchRange = part.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (matchRange) {
+      const start = Math.max(1, parseInt(matchRange[1], 10));
+      const end = Math.min(totalPages, parseInt(matchRange[2], 10));
+      if (start <= end) {
+        const indices: number[] = [];
+        for (let i = start; i <= end; i++) indices.push(i - 1);
+        ranges.push(indices);
+      }
+      continue;
+    }
+    const single = parseInt(part, 10);
+    if (Number.isFinite(single) && single >= 1 && single <= totalPages) {
+      ranges.push([single - 1]);
+    }
+  }
+  return ranges.length ? ranges : Array.from({ length: totalPages }, (_, i) => [i]);
+}
+
+async function splitPdf(inputPath: string, jobDir: string, options: ToolOptions = {}) {
+  const bytes = fs.readFileSync(inputPath);
+  const source = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPages = source.getPageCount();
+  if (totalPages === 0) throw new Error('PDF không có trang nào.');
+
+  const mode = pickString(options.mode, ['pages', 'ranges'] as const, 'pages');
+  const baseName = path.parse(inputPath).name;
+  const outputs: string[] = [];
+
+  if (mode === 'pages') {
+    for (let i = 0; i < totalPages; i++) {
+      const target = await PDFDocument.create();
+      const [page] = await target.copyPages(source, [i]);
+      target.addPage(page);
+      const outputPath = path.join(jobDir, `${baseName}-page-${String(i + 1).padStart(2, '0')}.pdf`);
+      fs.writeFileSync(outputPath, await target.save());
+      outputs.push(outputPath);
+    }
+  } else {
+    const ranges = parsePageRanges(String(options.ranges || ''), totalPages);
+    for (let i = 0; i < ranges.length; i++) {
+      const indices = ranges[i];
+      const target = await PDFDocument.create();
+      const pages = await target.copyPages(source, indices);
+      for (const page of pages) target.addPage(page);
+      const label = indices.length === 1
+        ? `page-${String(indices[0] + 1).padStart(2, '0')}`
+        : `pages-${indices[0] + 1}-${indices[indices.length - 1] + 1}`;
+      const outputPath = path.join(jobDir, `${baseName}-${label}.pdf`);
+      fs.writeFileSync(outputPath, await target.save());
+      outputs.push(outputPath);
+    }
+  }
+  return outputs;
+}
+
+const PREVIEW_ROW_LIMIT = 200;
+const PREVIEW_TEXT_LIMIT = 200_000;
+
+function previewCellString(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+async function buildPreview(filePath: string): Promise<unknown> {
+  const extension = path.extname(filePath).toLowerCase();
+
+  if (extension === '.xlsx') {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(filePath);
+    const sheets = workbook.worksheets.map((worksheet) => {
+      const { headers, rows } = extractWorksheet(worksheet);
+      return {
+        name: worksheet.name,
+        headers,
+        totalRows: rows.length,
+        rows: rows.slice(0, PREVIEW_ROW_LIMIT).map((row) => headers.map((header) => previewCellString(row[header])))
+      };
+    });
+    return { kind: 'workbook', sheets };
+  }
+
+  if (extension === '.csv') {
+    const raw = fs.readFileSync(filePath, 'utf8').replace(/^﻿/, '');
+    const lines = raw.split(/\r?\n/).filter((line) => line.length > 0);
+    if (!lines.length) return { kind: 'workbook', sheets: [{ name: 'CSV', headers: [], totalRows: 0, rows: [] }] };
+    const parseLine = (line: string): string[] => {
+      const cells: string[] = [];
+      let cell = '';
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line.charAt(i);
+        if (quoted) {
+          if (ch === '"' && line.charAt(i + 1) === '"') { cell += '"'; i++; }
+          else if (ch === '"') quoted = false;
+          else cell += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === ',') { cells.push(cell); cell = ''; }
+        else cell += ch;
+      }
+      cells.push(cell);
+      return cells;
+    };
+    const allRows = lines.map(parseLine);
+    const [headerRow, ...bodyRows] = allRows;
+    return {
+      kind: 'workbook',
+      sheets: [{
+        name: path.basename(filePath, extension),
+        headers: headerRow,
+        totalRows: bodyRows.length,
+        rows: bodyRows.slice(0, PREVIEW_ROW_LIMIT)
+      }]
+    };
+  }
+
+  if (extension === '.json') {
+    const text = fs.readFileSync(filePath, 'utf8');
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return { kind: 'text', text: text.slice(0, PREVIEW_TEXT_LIMIT) };
+    }
+    if (data && typeof data === 'object' && Array.isArray((data as { sheets?: unknown }).sheets)) {
+      const sheets = (data as { sheets: Array<{ name?: string; headers?: string[]; rows?: Record<string, unknown>[] }> }).sheets.map((sheet, index) => {
+        const rows = Array.isArray(sheet.rows) ? sheet.rows : [];
+        const headers = sheet.headers && sheet.headers.length
+          ? sheet.headers
+          : Array.from(new Set(rows.flatMap((row) => Object.keys(row || {}))));
+        return {
+          name: sheet.name || `Sheet${index + 1}`,
+          headers,
+          totalRows: rows.length,
+          rows: rows.slice(0, PREVIEW_ROW_LIMIT).map((row) => headers.map((header) => previewCellString(row?.[header])))
+        };
+      });
+      return { kind: 'workbook', sheets };
+    }
+    if (Array.isArray(data) && data.length && typeof data[0] === 'object') {
+      const headers = Array.from(new Set((data as Record<string, unknown>[]).flatMap((row) => Object.keys(row || {}))));
+      return {
+        kind: 'workbook',
+        sheets: [{
+          name: 'JSON',
+          headers,
+          totalRows: data.length,
+          rows: (data as Record<string, unknown>[]).slice(0, PREVIEW_ROW_LIMIT).map((row) => headers.map((header) => previewCellString(row?.[header])))
+        }]
+      };
+    }
+    return { kind: 'text', text: JSON.stringify(data, null, 2).slice(0, PREVIEW_TEXT_LIMIT) };
+  }
+
+  const text = fs.readFileSync(filePath, 'utf8').slice(0, PREVIEW_TEXT_LIMIT);
+  return { kind: 'text', text };
+}
+
+async function processFileConversion(tool: FileTool, inputPath: string, jobDir: string, options: ToolOptions = {}) {
   const out = (suffix: string, extension: string) => path.join(jobDir, outputName(inputPath, suffix, extension));
   const safeOut = (suffix: string, extension: string) => {
     const outputPath = out(suffix, extension);
@@ -1000,22 +1807,22 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
     }
     case 'image-to-png': {
       const outputPath = safeOut('', 'png');
-      await convertImage(inputPath, outputPath, 'png');
+      await convertImage(inputPath, outputPath, 'png', options);
       return outputPath;
     }
     case 'image-to-jpeg': {
       const outputPath = safeOut('', 'jpg');
-      await convertImage(inputPath, outputPath, 'jpeg');
+      await convertImage(inputPath, outputPath, 'jpeg', options);
       return outputPath;
     }
     case 'image-to-webp': {
       const outputPath = safeOut('', 'webp');
-      await convertImage(inputPath, outputPath, 'webp');
+      await convertImage(inputPath, outputPath, 'webp', options);
       return outputPath;
     }
     case 'image-to-avif': {
       const outputPath = safeOut('', 'avif');
-      await convertImage(inputPath, outputPath, 'avif');
+      await convertImage(inputPath, outputPath, 'avif', options);
       return outputPath;
     }
     case 'image-to-pdf': {
@@ -1024,26 +1831,28 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
       return outputPath;
     }
     case 'pdf-to-png': {
-      return pdfToPng(inputPath, jobDir);
+      return pdfToPng(inputPath, jobDir, options);
     }
     case 'compress-image': {
       const outputPath = out('-compressed', 'jpg');
-      await compressImage(inputPath, outputPath);
+      await compressImage(inputPath, outputPath, options);
       return outputPath;
     }
     case 'resize-image': {
-      const outputPath = out('-1920', 'webp');
-      await resizeImage(inputPath, outputPath);
+      const width = clampInt(options.width, 1920, 200, 6000);
+      const outputPath = out(`-${width}`, 'webp');
+      await resizeImage(inputPath, outputPath, options);
       return outputPath;
     }
     case 'upscale-image': {
-      const outputPath = out('-2x', 'png');
-      await upscaleImage(inputPath, outputPath);
+      const scaleLabel = pickString(options.scale, ['2x', '3x', '4x'] as const, '2x');
+      const outputPath = out(`-${scaleLabel}`, 'png');
+      await upscaleImage(inputPath, outputPath, options);
       return outputPath;
     }
     case 'square-thumbnail': {
       const outputPath = out('-square', 'webp');
-      await squareThumbnail(inputPath, outputPath);
+      await squareThumbnail(inputPath, outputPath, options);
       return outputPath;
     }
     case 'strip-metadata': {
@@ -1060,6 +1869,53 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
     case 'scan-document': {
       const outputPath = out('-scan', 'png');
       await scanDocument(inputPath, outputPath);
+      return outputPath;
+    }
+    case 'remove-background': {
+      const outputPath = safeOut('-nobg', 'png');
+      await removeBackground(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'chroma-key': {
+      const outputPath = safeOut('-keyed', 'png');
+      await chromaKey(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'crop-image': {
+      const aspect = pickString(
+        options.aspect,
+        ['custom', 'square', '4:3', '3:2', '16:9', '9:16', '3:4', '2:3'] as const,
+        'custom'
+      );
+      const suffix = aspect === 'custom' ? '-crop' : `-${aspect.replace(':', 'x')}`;
+      const outputPath = safeOut(suffix, 'png');
+      await cropImage(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'rotate-image': {
+      const deg = clampInt(options.rotate, 0, -360, 360);
+      const suffix = deg !== 0 ? `-r${deg}` : (options.flipH || options.flipV ? '-flip' : '-rotated');
+      const outputPath = safeOut(suffix, 'png');
+      await rotateImage(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'filter-image': {
+      const filter = pickString(
+        options.filter,
+        ['grayscale', 'sepia', 'invert', 'blur', 'sharpen', 'brightness', 'cool', 'warm'] as const,
+        'grayscale'
+      );
+      const outputPath = safeOut(`-${filter}`, 'jpg');
+      await filterImage(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'split-pdf': {
+      return splitPdf(inputPath, jobDir, options);
+    }
+    case 'merge-pdf': {
+      // Handled at batch level; single-file run merges just one file
+      const outputPath = out('-merged', 'pdf');
+      await mergePdf([inputPath], outputPath);
       return outputPath;
     }
     default:
@@ -1294,6 +2150,380 @@ function toDownloadFile(job: ConvertJob, file: LocalFile): JobFile {
   };
 }
 
+function stripHtml(value: string) {
+  return value
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractMeta(html: string, keys: string[]) {
+  for (const key of keys) {
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = [
+      new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i'),
+      new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`, 'i')
+    ];
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match?.[1]) return stripHtml(match[1]);
+    }
+  }
+  return '';
+}
+
+function extractTitle(html: string) {
+  return extractMeta(html, ['og:title', 'twitter:title'])
+    || stripHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '');
+}
+
+function extractParagraphs(html: string) {
+  const articleBlocks = html.match(/<article[\s\S]*?<\/article>/gi) || [html];
+  const source = articleBlocks.join('\n');
+  const matches = [...source.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)];
+  const seen = new Set<string>();
+  return matches
+    .map((match) => stripHtml(match[1]))
+    .filter((text) => text.length >= 55 && text.length <= 900)
+    .filter((text) => {
+      const key = text.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return !/(cookie|copyright|đăng nhập|newsletter|subscribe|quảng cáo)/i.test(text);
+    })
+    .slice(0, 18);
+}
+
+function absoluteUrl(value: string, base: string) {
+  if (!value) return '';
+  try {
+    return new URL(value, base).toString();
+  } catch {
+    return '';
+  }
+}
+
+async function fetchText(url: string) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; ConvertURLStudio/1.0; +https://convert-url-api.onrender.com)',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    },
+    signal: AbortSignal.timeout(25000)
+  });
+  if (!response.ok) throw new Error(`Không lấy được bài viết. HTTP ${response.status}`);
+  const text = await response.text();
+  return text.slice(0, 2_500_000);
+}
+
+async function fetchArticle(url: string): Promise<NewsArticle> {
+  const parsed = new URL(url);
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Chỉ hỗ trợ URL http/https.');
+  }
+
+  const html = await fetchText(url);
+  const imageUrl = absoluteUrl(extractMeta(html, ['og:image', 'twitter:image']), url);
+  const title = extractTitle(html);
+  const description = extractMeta(html, ['og:description', 'description', 'twitter:description']);
+  const paragraphs = extractParagraphs(html);
+
+  if (!title || paragraphs.length < 2) {
+    throw new Error('Không trích xuất đủ nội dung bài viết. Hãy thử URL bài báo chi tiết khác.');
+  }
+
+  return {
+    url,
+    host: parsed.hostname.replace(/^www\./, ''),
+    title,
+    description,
+    siteName: extractMeta(html, ['og:site_name', 'application-name']) || parsed.hostname.replace(/^www\./, ''),
+    author: extractMeta(html, ['author', 'article:author']),
+    publishedAt: extractMeta(html, ['article:published_time', 'pubdate', 'date', 'datePublished']),
+    imageUrl,
+    paragraphs
+  };
+}
+
+function sentenceScore(sentence: string) {
+  let score = Math.min(sentence.length, 240);
+  if (/\d|%|tỷ|triệu|ngày|tháng|năm|USD|VND/i.test(sentence)) score += 40;
+  if (/cho biết|theo|dự kiến|nguyên nhân|ảnh hưởng|kết quả|công bố/i.test(sentence)) score += 25;
+  return score;
+}
+
+function pickKeyPoints(article: NewsArticle) {
+  const sentences = article.paragraphs
+    .join(' ')
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 45 && item.length <= 260);
+
+  const picked = sentences
+    .map((text) => ({ text, score: sentenceScore(text) }))
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.text)
+    .filter((text, index, all) => all.findIndex((other) => other.slice(0, 60) === text.slice(0, 60)) === index)
+    .slice(0, 5);
+
+  return picked.length ? picked : article.paragraphs.slice(0, 5);
+}
+
+function buildNewsStoryboard(article: NewsArticle, request: NewsVideoRequest) {
+  const keyPoints = pickKeyPoints(article);
+  const sourceLine = `${article.siteName || article.host}${article.publishedAt ? ` · ${new Date(article.publishedAt).toLocaleDateString('vi-VN')}` : ''}`;
+  const toneLead = request.tone === 'social'
+    ? 'Điểm đáng chú ý nhất hôm nay'
+    : request.tone === 'executive'
+      ? 'Tóm tắt điều hành'
+      : 'Tin chính cần biết';
+
+  const slides: StorySlide[] = [
+    {
+      label: 'HOOK',
+      headline: article.title,
+      body: [article.description || toneLead]
+    },
+    {
+      label: 'SOURCE',
+      headline: toneLead,
+      body: [sourceLine, article.author ? `Tác giả/nguồn: ${article.author}` : `Nguồn: ${article.host}`]
+    },
+    {
+      label: 'KEY POINTS',
+      headline: 'Các ý chính',
+      body: keyPoints.slice(0, 3)
+    },
+    {
+      label: 'CONTEXT',
+      headline: 'Bối cảnh',
+      body: keyPoints.slice(3, 5).length ? keyPoints.slice(3, 5) : article.paragraphs.slice(1, 3)
+    },
+    {
+      label: 'APPROVAL',
+      headline: 'Bản nháp chờ duyệt',
+      body: [
+        'Kiểm tra lại nguồn, hình ảnh và nội dung trước khi đăng.',
+        `Link gốc: ${article.url}`
+      ]
+    }
+  ];
+
+  const voiceover = slides
+    .map((slide) => `${slide.headline}. ${slide.body.join(' ')}`)
+    .join('\n\n');
+
+  return { slides, keyPoints, voiceover, sourceLine };
+}
+
+function wrapText(text: string, maxChars: number, maxLines: number) {
+  const words = stripHtml(text).split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (next.length > maxChars && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+    if (lines.length >= maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  if (words.join(' ').length > lines.join(' ').length && lines.length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].replace(/[,.!?;:]*$/, '')}...`;
+  }
+  return lines;
+}
+
+function svgEscape(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function svgMultiline(lines: string[], x: number, y: number, size: number, weight = 700, fill = '#ffffff', lineHeight = 1.2) {
+  const tspans = lines.map((line, index) =>
+    `<tspan x="${x}" dy="${index === 0 ? 0 : size * lineHeight}">${svgEscape(line)}</tspan>`
+  ).join('');
+  return `<text x="${x}" y="${y}" font-family="Arial, 'Noto Sans', sans-serif" font-size="${size}" font-weight="${weight}" fill="${fill}">${tspans}</text>`;
+}
+
+async function downloadImageBuffer(url: string) {
+  if (!url) return null;
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ConvertURLStudio/1.0)' },
+      signal: AbortSignal.timeout(18000)
+    });
+    if (!response.ok) return null;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null;
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer).subarray(0, 8_000_000);
+  } catch {
+    return null;
+  }
+}
+
+async function createNewsSlide(slide: StorySlide, article: NewsArticle, outputPath: string, index: number, total: number, format: NewsVideoRequest['format'], imageBuffer: Buffer | null) {
+  const portrait = format === 'short';
+  const width = portrait ? 1080 : 1920;
+  const height = portrait ? 1920 : 1080;
+  const margin = portrait ? 86 : 110;
+  const titleSize = portrait ? 62 : 70;
+  const bodySize = portrait ? 35 : 38;
+  const maxTitleChars = portrait ? 22 : 42;
+  const maxBodyChars = portrait ? 34 : 58;
+
+  const base = imageBuffer
+    ? await sharp(imageBuffer, { failOn: 'none' })
+      .resize(width, height, { fit: 'cover' })
+      .blur(12)
+      .modulate({ brightness: 0.55, saturation: 0.82 })
+      .png()
+      .toBuffer()
+    : await sharp({
+      create: {
+        width,
+        height,
+        channels: 4,
+        background: index % 2 ? '#102a43' : '#123b3a'
+      }
+    }).png().toBuffer();
+
+  const titleLines = wrapText(slide.headline, maxTitleChars, portrait ? 5 : 3);
+  const bodyLines = slide.body.flatMap((item) => wrapText(item, maxBodyChars, 2)).slice(0, portrait ? 8 : 6);
+  const source = `${article.siteName || article.host} · ${index + 1}/${total}`;
+
+  const overlay = `
+    <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="${width}" height="${height}" fill="rgba(0,0,0,0.32)"/>
+      <rect x="${margin}" y="${margin}" width="${width - margin * 2}" height="${height - margin * 2}" rx="28" fill="rgba(15,23,42,0.58)" stroke="rgba(255,255,255,0.18)" stroke-width="2"/>
+      <text x="${margin + 34}" y="${margin + 66}" font-family="Arial, 'Noto Sans', sans-serif" font-size="${portrait ? 28 : 30}" font-weight="800" fill="#5eead4" letter-spacing="0">${svgEscape(slide.label)}</text>
+      ${svgMultiline(titleLines, margin + 34, margin + (portrait ? 176 : 170), titleSize, 900, '#ffffff', 1.12)}
+      ${svgMultiline(bodyLines.map((line) => `• ${line}`), margin + 38, height - margin - (portrait ? 470 : 330), bodySize, 650, '#dbeafe', 1.28)}
+      <text x="${margin + 34}" y="${height - margin - 42}" font-family="Arial, 'Noto Sans', sans-serif" font-size="${portrait ? 25 : 28}" font-weight="700" fill="#cbd5e1">${svgEscape(source)}</text>
+      <text x="${width - margin - 34}" y="${height - margin - 42}" text-anchor="end" font-family="Arial, 'Noto Sans', sans-serif" font-size="${portrait ? 23 : 25}" font-weight="700" fill="#fbbf24">DRAFT · REVIEW REQUIRED</text>
+    </svg>
+  `;
+
+  await sharp(base)
+    .composite([{ input: Buffer.from(overlay), top: 0, left: 0 }])
+    .png()
+    .toFile(outputPath);
+}
+
+function concatFileLine(filePath: string) {
+  const normalized = filePath.replace(/\\/g, '/').replace(/'/g, "'\\''");
+  return `file '${normalized}'`;
+}
+
+async function renderNewsVideo(slidePaths: string[], outputPath: string) {
+  const listPath = path.join(path.dirname(outputPath), 'slides.txt');
+  const lines: string[] = [];
+  for (const slidePath of slidePaths) {
+    lines.push(concatFileLine(slidePath));
+    lines.push('duration 4.2');
+  }
+  lines.push(concatFileLine(slidePaths[slidePaths.length - 1]));
+  fs.writeFileSync(listPath, lines.join('\n'), 'utf8');
+
+  await run('ffmpeg', [
+    '-y',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', listPath,
+    '-vf', 'fps=30,format=yuv420p',
+    '-movflags', '+faststart',
+    outputPath
+  ], { timeoutMs: 180000 });
+}
+
+function normalizeNewsVideoRequest(body: Record<string, unknown>): NewsVideoRequest {
+  const url = typeof body.url === 'string' ? body.url.trim() : '';
+  if (!url) throw new Error('Cần nhập URL bài báo.');
+  return {
+    url,
+    format: body.format === 'landscape' ? 'landscape' : 'short',
+    language: body.language === 'en' ? 'en' : 'vi',
+    tone: body.tone === 'social' || body.tone === 'executive' ? body.tone : 'newsroom',
+    autoPublish: body.autoPublish === true
+  };
+}
+
+async function createNewsVideoDraft(body: Record<string, unknown>) {
+  const request = normalizeNewsVideoRequest(body);
+  const { id, jobDir } = createUtilityDir();
+  const article = await fetchArticle(request.url);
+  const storyboard = buildNewsStoryboard(article, request);
+  const imageBuffer = await downloadImageBuffer(article.imageUrl);
+  const slidePaths: string[] = [];
+
+  for (const [index, slide] of storyboard.slides.entries()) {
+    const slidePath = path.join(jobDir, `news-slide-${String(index + 1).padStart(2, '0')}.png`);
+    await createNewsSlide(slide, article, slidePath, index, storyboard.slides.length, request.format, imageBuffer);
+    slidePaths.push(slidePath);
+  }
+
+  const videoPath = path.join(jobDir, `news-video-${request.format}.mp4`);
+  await renderNewsVideo(slidePaths, videoPath);
+
+  const scriptPath = path.join(jobDir, 'news-script.txt');
+  const draftPath = path.join(jobDir, 'news-draft.json');
+  fs.writeFileSync(scriptPath, storyboard.voiceover, 'utf8');
+  fs.writeFileSync(draftPath, JSON.stringify({
+    id,
+    status: request.autoPublish ? 'ready_for_auto_publish' : 'pending_approval',
+    compliance: {
+      sourceAttributionRequired: true,
+      imageRightsMustBeVerified: Boolean(article.imageUrl),
+      note: 'Bản nháp dùng nội dung tóm tắt và attribution. Hãy kiểm tra quyền ảnh/bài viết trước khi đăng công khai.'
+    },
+    publishPlan: {
+      youtube: request.autoPublish ? 'queued_after_approval_token_setup' : 'manual_approval_required',
+      tiktok: request.autoPublish ? 'queued_after_approval_token_setup' : 'manual_approval_required',
+      sheet: 'ready_to_sync_when_google_sheet_connector_is_configured'
+    },
+    request,
+    article,
+    keyPoints: storyboard.keyPoints,
+    slides: storyboard.slides
+  }, null, 2), 'utf8');
+
+  return {
+    id,
+    status: request.autoPublish ? 'ready_for_auto_publish' : 'pending_approval',
+    article,
+    keyPoints: storyboard.keyPoints,
+    slides: storyboard.slides,
+    script: storyboard.voiceover,
+    publishPlan: {
+      youtube: request.autoPublish ? 'queued_after_approval_token_setup' : 'manual_approval_required',
+      tiktok: request.autoPublish ? 'queued_after_approval_token_setup' : 'manual_approval_required',
+      sheet: 'ready_to_sync_when_google_sheet_connector_is_configured'
+    },
+    files: [
+      fileToDownload(id, videoPath),
+      fileToDownload(id, slidePaths[0]),
+      fileToDownload(id, scriptPath),
+      fileToDownload(id, draftPath)
+    ]
+  };
+}
+
 async function processJob(job: ConvertJob) {
   try {
     updateJob(job, { status: 'running', progress: 3, step: 'Validating URL' });
@@ -1423,12 +2653,13 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady] = await Promise.all([
+      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady, rembgReady] = await Promise.all([
         hasYtdlp(),
         hasCommand('ffmpeg', ['-version'], 5000),
         hasCommand('ffprobe', ['-version'], 5000),
         hasCommand(SOFFICE, libreOfficeHealthArgs(), 12000),
-        hasCommand('pdf2docx', ['--help'], 12000)
+        hasCommand('pdf2docx', ['--help'], 12000),
+        hasCommand('rembg', ['--version'], 8000)
       ]);
 
       sendJson(res, 200, {
@@ -1438,6 +2669,7 @@ const server = http.createServer(async (req, res) => {
         ffprobeReady,
         libreOfficeReady,
         pdf2docxReady,
+        rembgReady,
         openAIReady: Boolean(process.env.OPENAI_API_KEY),
         nodeVersion: process.version,
         message: ytdlpReady && ffmpegReady && ffprobeReady ? 'Ready' : 'Missing required tools'
@@ -1445,21 +2677,199 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/content/news-video') {
+      const result = await createNewsVideoDraft(await parseBody(req));
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/news/feed') {
+      const articles = newsStore.getAll().map(publicArticle);
+      sendJson(res, 200, {
+        articles,
+        lastRefreshAt: newsStore.getLastRefreshAt(),
+        total: articles.length
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/news/refresh') {
+      const summary = await refreshNewsFeed(newsStore);
+      sendJson(res, 200, {
+        ...summary,
+        lastRefreshAt: newsStore.getLastRefreshAt()
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/api/news/articles/')) {
+      const id = decodeURIComponent(url.pathname.slice('/api/news/articles/'.length).split('/')[0] || '');
+      if (!id) {
+        sendJson(res, 400, { error: 'Missing article id.' });
+        return;
+      }
+      const article = newsStore.get(id);
+      if (!article) {
+        sendJson(res, 404, { error: 'Article not found.' });
+        return;
+      }
+      sendJson(res, 200, publicArticle(article));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/api/news/articles/')) {
+      const parts = url.pathname.slice('/api/news/articles/'.length).split('/').filter(Boolean);
+      const id = decodeURIComponent(parts[0] || '');
+      const action = parts[1] || '';
+      const article = newsStore.get(id);
+      if (!article) {
+        sendJson(res, 404, { error: 'Article not found.' });
+        return;
+      }
+      if (action === 'extract') {
+        const updated = await reenrichArticle(newsStore, id);
+        sendJson(res, 200, updated ? publicArticle(updated) : { error: 'Update failed.' });
+        return;
+      }
+      if (action === 'approve') {
+        const updated = newsStore.update(id, { status: 'approved', error: null });
+        sendJson(res, 200, updated ? publicArticle(updated) : { error: 'Update failed.' });
+        return;
+      }
+      if (action === 'reject') {
+        const updated = newsStore.update(id, { status: 'rejected', error: null });
+        sendJson(res, 200, updated ? publicArticle(updated) : { error: 'Update failed.' });
+        return;
+      }
+      sendJson(res, 400, { error: `Unknown action: ${action}` });
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/file-jobs') {
       const upload = await parseMultipartUpload(req);
-      try {
-        const outputPath = await processFileConversion(upload.tool, upload.filePath, upload.jobDir);
-        const outputPaths = Array.isArray(outputPath) ? outputPath : [outputPath];
-        sendJson(res, 200, {
-          id: upload.id,
-          status: 'completed',
-          tool: upload.tool,
-          input: upload.originalName,
-          files: outputPaths.map((filePath) => fileToDownload(upload.id, filePath))
-        });
-      } catch (error) {
+      const items: Array<{ input: string; files?: JobFile[]; error?: string }> = [];
+      const allFiles: JobFile[] = [];
+
+      // merge-pdf consumes all uploaded files and produces ONE merged PDF
+      if (upload.tool === 'merge-pdf' && upload.files.length > 1) {
+        try {
+          const baseName = path.parse(upload.files[0].originalName).name;
+          const outputPath = path.join(upload.jobDir, `${baseName}-merged.pdf`);
+          await mergePdf(upload.files.map((file) => file.filePath), outputPath);
+          const download = fileToDownload(upload.id, outputPath);
+          const inputsLabel = `${upload.files.length} PDF → ${path.basename(outputPath)}`;
+          items.push({ input: inputsLabel, files: [download] });
+          allFiles.push(download);
+        } catch (error) {
+          items.push({
+            input: upload.files.map((f) => f.originalName).join(', '),
+            error: error instanceof Error ? error.message : 'PDF merge failed.'
+          });
+        }
+      } else {
+        for (const uploaded of upload.files) {
+          try {
+            const outputPath = await processFileConversion(upload.tool, uploaded.filePath, upload.jobDir, upload.options);
+            const outputPaths = Array.isArray(outputPath) ? outputPath : [outputPath];
+            const downloads = outputPaths.map((p) => fileToDownload(upload.id, p));
+            items.push({ input: uploaded.originalName, files: downloads });
+            allFiles.push(...downloads);
+          } catch (error) {
+            items.push({
+              input: uploaded.originalName,
+              error: error instanceof Error ? error.message : 'Conversion failed.'
+            });
+          }
+        }
+      }
+
+      if (allFiles.length === 0) {
         fs.rmSync(upload.jobDir, { recursive: true, force: true });
-        throw error;
+        const firstError = items.find((item) => item.error)?.error || 'All conversions failed.';
+        throw new Error(firstError);
+      }
+
+      const status = items.every((item) => !item.error) ? 'completed' : 'partial';
+      sendJson(res, 200, {
+        id: upload.id,
+        status,
+        tool: upload.tool,
+        input: items[0]?.input ?? '',
+        items,
+        files: allFiles
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/api/preview/')) {
+      const parts = url.pathname.slice('/api/preview/'.length).split('/').filter(Boolean);
+      if (parts.length !== 2) {
+        sendJson(res, 400, { error: 'Preview path must be /api/preview/{id}/{filename}.' });
+        return;
+      }
+      const [id, filename] = parts.map(decodeURIComponent);
+      const filePath = path.resolve(DOWNLOAD_DIR, id, filename);
+      const downloadsRoot = path.resolve(DOWNLOAD_DIR);
+      if (!filePath.startsWith(`${downloadsRoot}${path.sep}`)) {
+        sendJson(res, 403, { error: 'Forbidden.' });
+        return;
+      }
+      if (!fs.existsSync(filePath)) {
+        sendJson(res, 404, { error: 'File not found.' });
+        return;
+      }
+      try {
+        const preview = await buildPreview(filePath);
+        sendJson(res, 200, preview);
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : 'Preview failed.' });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/api/zip/')) {
+      const id = decodeURIComponent(url.pathname.slice('/api/zip/'.length).split('/')[0] || '');
+      if (!/^[\w-]+$/.test(id)) {
+        sendJson(res, 400, { error: 'Invalid job id.' });
+        return;
+      }
+      const jobDir = path.resolve(DOWNLOAD_DIR, id);
+      const downloadsRoot = path.resolve(DOWNLOAD_DIR);
+      if (!jobDir.startsWith(`${downloadsRoot}${path.sep}`) || !fs.existsSync(jobDir) || !fs.statSync(jobDir).isDirectory()) {
+        sendJson(res, 404, { error: 'Job not found.' });
+        return;
+      }
+      try {
+        const requestedNames = url.searchParams.getAll('file');
+        const entryNames = requestedNames.length
+          ? requestedNames
+          : fs.readdirSync(jobDir).filter((name) => {
+            const full = path.join(jobDir, name);
+            return fs.statSync(full).isFile() && !name.startsWith('.') && !name.endsWith('.part');
+          });
+        const entries: ZipEntry[] = entryNames
+          .map((name) => path.basename(name))
+          .filter((name) => {
+            const full = path.join(jobDir, name);
+            return fs.existsSync(full) && fs.statSync(full).isFile();
+          })
+          .map((name) => ({ name, data: fs.readFileSync(path.join(jobDir, name)) }));
+        if (!entries.length) {
+          sendJson(res, 404, { error: 'No files to archive.' });
+          return;
+        }
+        const zip = buildZip(entries);
+        const downloadName = `convert-${id.slice(0, 8)}.zip`;
+        res.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'Content-Length': String(zip.length),
+          'Content-Disposition': `attachment; filename="${downloadName}"`,
+          'Cache-Control': 'no-store',
+          ...corsHeaders()
+        });
+        res.end(zip);
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : 'Zip failed.' });
       }
       return;
     }
