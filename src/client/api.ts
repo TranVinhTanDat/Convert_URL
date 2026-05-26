@@ -9,7 +9,8 @@ import type {
   NewsRefreshResponse,
   NewsVideoRequest,
   NewsVideoResult,
-  PreviewPayload
+  PreviewPayload,
+  TranscriptResult
 } from './types';
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
@@ -124,4 +125,12 @@ export function approveArticle(id: string): Promise<NewsArticle> {
 
 export function rejectArticle(id: string): Promise<NewsArticle> {
   return request<NewsArticle>(`/api/news/articles/${encodeURIComponent(id)}/reject`, { method: 'POST' });
+}
+
+export function fetchTranscript(payload: { url: string; languages?: string[]; useWhisper?: boolean }): Promise<TranscriptResult> {
+  return request<TranscriptResult>('/api/transcript', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
 }

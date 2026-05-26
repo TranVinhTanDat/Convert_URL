@@ -1,29 +1,46 @@
 import {
   AlertTriangle,
   Archive,
+  ArrowRight,
   Camera,
   CheckCircle2,
+  ChevronRight,
   Clipboard,
+  ClipboardCheck,
   Clock,
   Database,
   Download,
+  Eraser,
   FileSpreadsheet,
   FileText,
+  FileType2,
+  Film,
+  Filter,
   History,
   Image,
+  Languages,
+  Layers,
   Link2,
   Loader2,
+  Mic,
   Newspaper,
+  Palette,
   PlayCircle,
+  ScanLine,
   Search,
   Send,
   Settings2,
   ShieldCheck,
   Sparkles,
+  Star,
   Trash2,
+  TrendingUp,
   UploadCloud,
+  Volume2,
   Wand2,
-  XCircle
+  Workflow,
+  XCircle,
+  Zap
 } from 'lucide-react';
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -32,6 +49,7 @@ import {
   createJob,
   createNewsVideo,
   extractArticle,
+  fetchTranscript,
   getHealth,
   getJob,
   getNewsFeed,
@@ -53,10 +71,12 @@ import type {
   NewsVideoResult,
   OutputFormat,
   PreviewPayload,
-  PreviewSheet
+  PreviewSheet,
+  TranscriptResult
 } from './types';
 
-type ActiveTool = 'content' | 'media' | 'files';
+type ActiveTool = 'content' | 'media' | 'files' | 'transcript' | 'lab' | 'workflows' | 'library';
+type TranscriptView = 'plain' | 'timeline' | 'markdown' | 'srt';
 type FileGroupId = 'documents' | 'data' | 'images';
 
 interface FileTool {
@@ -906,6 +926,197 @@ interface RecentEntry {
   createdAt: number;
 }
 
+// ====================== AI Lab + Workflow data ======================
+
+interface AILabCard {
+  id: string;
+  title: string;
+  description: string;
+  tag: string;
+  accent: 'emerald' | 'peach' | 'violet' | 'sky' | 'rose' | 'amber';
+  icon: 'eraser' | 'palette' | 'zap' | 'scan' | 'languages' | 'mic' | 'wand' | 'volume' | 'image';
+  action?: { tool: FileToolId; group: FileGroupId; label: string };
+  available: boolean;
+  comingSoon?: string;
+}
+
+const aiLabCards: AILabCard[] = [
+  {
+    id: 'remove-bg',
+    title: 'Xoá nền AI',
+    description: 'Tách subject khỏi nền bằng U2Net / IS-Net, xuất PNG trong suốt. Hợp ảnh sản phẩm, chân dung, logo.',
+    tag: 'Image · AI',
+    accent: 'emerald',
+    icon: 'eraser',
+    action: { tool: 'remove-background', group: 'images', label: 'Mở Xoá nền AI' },
+    available: true
+  },
+  {
+    id: 'chroma',
+    title: 'Chroma Key',
+    description: 'Đổi 1 màu nền đặc (trắng/đen/xanh chroma) thành trong suốt. Auto detect màu góc hoặc chọn HEX tuỳ ý.',
+    tag: 'Image · Studio',
+    accent: 'sky',
+    icon: 'palette',
+    action: { tool: 'chroma-key', group: 'images', label: 'Mở Chroma Key' },
+    available: true
+  },
+  {
+    id: 'upscale',
+    title: 'Upscale 4x',
+    description: 'Phóng ảnh tới 4x bằng Lanczos + làm nét nhẹ. Hợp ảnh nhỏ cần sắc nét cho web hoặc in.',
+    tag: 'Image · Enhance',
+    accent: 'violet',
+    icon: 'zap',
+    action: { tool: 'upscale-image', group: 'images', label: 'Mở Upscale' },
+    available: true
+  },
+  {
+    id: 'scan-doc',
+    title: 'Scan tài liệu',
+    description: 'Làm sạch ảnh chụp giấy: xoay theo metadata, xám hoá, tăng tương phản, sharpen rồi xuất PNG.',
+    tag: 'Document · Scan',
+    accent: 'amber',
+    icon: 'scan',
+    action: { tool: 'scan-document', group: 'images', label: 'Mở Scan' },
+    available: true
+  },
+  {
+    id: 'whisper',
+    title: 'Whisper Transcript',
+    description: 'Trích script video bằng AI Whisper local. Hỗ trợ YouTube karaoke, TikTok, Vimeo — kèm timestamp.',
+    tag: 'Audio · Whisper',
+    accent: 'peach',
+    icon: 'mic',
+    action: { tool: 'remove-background', group: 'images', label: 'Mở Transcript' },
+    available: true
+  },
+  {
+    id: 'metadata',
+    title: 'Xoá Metadata',
+    description: 'Loại EXIF/metadata nhạy cảm (GPS, máy ảnh, ngày chụp) trước khi chia sẻ ảnh ra công khai.',
+    tag: 'Privacy · Image',
+    accent: 'rose',
+    icon: 'wand',
+    action: { tool: 'strip-metadata', group: 'images', label: 'Mở công cụ' },
+    available: true
+  },
+  {
+    id: 'ocr-translate',
+    title: 'OCR + Dịch',
+    description: 'Nhận diện chữ trong ảnh và dịch song ngữ Việt — Anh. Đang phát triển, dự kiến Q3 2026.',
+    tag: 'OCR · Soon',
+    accent: 'violet',
+    icon: 'languages',
+    available: false,
+    comingSoon: 'Q3 2026'
+  },
+  {
+    id: 'voice-clone',
+    title: 'Voice Clone',
+    description: 'Sao chép giọng đọc bằng 30s mẫu, tạo voice over tiếng Việt tự nhiên. Đang lab thử nghiệm.',
+    tag: 'Audio · Soon',
+    accent: 'peach',
+    icon: 'volume',
+    available: false,
+    comingSoon: 'Q4 2026'
+  },
+  {
+    id: 'style-transfer',
+    title: 'Style Transfer',
+    description: 'Áp style nghệ thuật (van Gogh, Monet, anime) lên ảnh chụp. Đang thử nghiệm với SDXL local.',
+    tag: 'Image · Soon',
+    accent: 'sky',
+    icon: 'image',
+    available: false,
+    comingSoon: 'Beta sắp ra'
+  }
+];
+
+interface WorkflowTemplate {
+  id: string;
+  title: string;
+  subtitle: string;
+  description: string;
+  accent: 'emerald' | 'peach' | 'violet' | 'sky' | 'rose' | 'amber';
+  icon: 'youtube' | 'image' | 'mic' | 'film' | 'fileType' | 'workflow';
+  steps: string[];
+  target: { tab: 'media' | 'files' | 'transcript'; tool?: FileToolId; group?: FileGroupId; format?: OutputFormat };
+  cta: string;
+  badge?: string;
+}
+
+const workflowTemplates: WorkflowTemplate[] = [
+  {
+    id: 'youtube-to-blog',
+    title: 'YouTube → Bài blog',
+    subtitle: 'Video YouTube thành transcript markdown sẵn đăng',
+    description: 'Lấy phụ đề YouTube (kể cả karaoke có tag <c>), fallback Whisper nếu cần, xuất Markdown với heading + timestamp.',
+    accent: 'rose',
+    icon: 'youtube',
+    steps: ['Dán link YouTube', 'Trích sub / Whisper', 'Xuất Markdown đẹp'],
+    target: { tab: 'transcript' },
+    cta: 'Mở Transcript',
+    badge: 'Phổ biến'
+  },
+  {
+    id: 'podcast-to-script',
+    title: 'Podcast → Script',
+    subtitle: 'Audio podcast thành kịch bản có timestamp',
+    description: 'Hỗ trợ Vimeo/SoundCloud/MP3 link. Whisper AI local xử lý audio dài, kèm dòng thời gian từng câu.',
+    accent: 'peach',
+    icon: 'mic',
+    steps: ['Dán link audio', 'Whisper local', 'Tải SRT / TXT'],
+    target: { tab: 'transcript' },
+    cta: 'Mở Transcript',
+    badge: 'AI'
+  },
+  {
+    id: 'youtube-mp3',
+    title: 'YouTube → MP3 nhạc',
+    subtitle: 'Tải audio chất lượng cao từ video URL',
+    description: 'Convert MP4/WebM thành MP3 320kbps. Bộ xử lý ffmpeg ổn định, giữ metadata, chuẩn hoá loudness.',
+    accent: 'emerald',
+    icon: 'youtube',
+    steps: ['Dán link video', 'Chọn MP3', 'Tải về'],
+    target: { tab: 'media', format: 'mp3' },
+    cta: 'Mở Media URL'
+  },
+  {
+    id: 'photos-web',
+    title: 'Ảnh → Web tối ưu',
+    subtitle: 'Resize 1920 + WebP cho website tải nhanh',
+    description: 'Batch upload nhiều ảnh, resize cạnh dài 1920px, xuất WebP quality 84. Hợp portfolio + landing page.',
+    accent: 'sky',
+    icon: 'image',
+    steps: ['Drag & drop ảnh', 'Resize 1920px', 'Xuất WebP batch'],
+    target: { tab: 'files', tool: 'resize-image', group: 'images' },
+    cta: 'Mở File Tools'
+  },
+  {
+    id: 'photos-pdf',
+    title: 'Ảnh → PDF hồ sơ',
+    subtitle: 'Gộp nhiều ảnh thành PDF chuẩn giấy A4',
+    description: 'Đóng JPEG/PNG thành PDF gọn, đúng tỉ lệ, sắp xếp theo thứ tự upload. Hợp gửi hồ sơ + in ấn.',
+    accent: 'amber',
+    icon: 'fileType',
+    steps: ['Chọn nhiều ảnh', 'Convert image-to-pdf', 'Tải file PDF'],
+    target: { tab: 'files', tool: 'image-to-pdf', group: 'images' },
+    cta: 'Mở File Tools'
+  },
+  {
+    id: 'excel-to-json',
+    title: 'Excel → JSON API',
+    subtitle: 'Xuất dữ liệu Excel thành JSON cho dev',
+    description: 'Smart header detection bỏ qua banner row + merged cell. Giữ tên sheet, xuất JSON có structure.',
+    accent: 'violet',
+    icon: 'fileType',
+    steps: ['Upload .xlsx', 'Convert', 'Xuất sheets[] JSON'],
+    target: { tab: 'files', tool: 'excel-to-json', group: 'data' },
+    cta: 'Mở File Tools'
+  }
+];
+
 const RECENT_LIMIT = 12;
 const RECENT_STORAGE_KEY = 'convert-url:recent-v1';
 
@@ -979,7 +1190,7 @@ function RecentJobsPanel({ entries, onPick, onClear }: { entries: RecentEntry[];
 }
 
 export function App() {
-  const [activeTool, setActiveTool] = useState<ActiveTool>('content');
+  const [activeTool, setActiveTool] = useState<ActiveTool>('files');
   const [activeFileGroup, setActiveFileGroup] = useState<FileGroupId>('documents');
   const [newsUrl, setNewsUrl] = useState('');
   const [newsFormat, setNewsFormat] = useState<NewsVideoRequest['format']>('short');
@@ -995,6 +1206,13 @@ export function App() {
   const [feedCategory, setFeedCategory] = useState<string>('all');
   const [feedStatusFilter, setFeedStatusFilter] = useState<'all' | 'pending' | 'approved'>('pending');
   const feedPollRef = useRef<number | null>(null);
+  const [transcriptUrl, setTranscriptUrl] = useState('');
+  const [transcriptLang, setTranscriptLang] = useState('auto');
+  const [transcriptBusy, setTranscriptBusy] = useState(false);
+  const [transcriptError, setTranscriptError] = useState('');
+  const [transcriptResult, setTranscriptResult] = useState<TranscriptResult | null>(null);
+  const [transcriptView, setTranscriptView] = useState<TranscriptView>('plain');
+  const [copiedField, setCopiedField] = useState<string>('');
   const [url, setUrl] = useState('');
   const [format, setFormat] = useState<OutputFormat>('mp4');
   const [quality, setQuality] = useState('best');
@@ -1213,7 +1431,48 @@ export function App() {
     setFileJobId(entry.jobId);
     setFileMessage(`Đã mở lại: ${entry.toolTitle}`);
     setFileError(false);
+    setActiveTool('files');
     pushToast({ variant: 'info', title: 'Mở lại từ lịch sử', detail: entry.toolTitle });
+  }
+
+  function openFileTool(toolId: FileToolId, groupId?: FileGroupId) {
+    const targetGroup = groupId ?? (toolGroups.find((group) => group.tools.some((t) => t.id === toolId))?.id);
+    if (targetGroup) setActiveFileGroup(targetGroup as FileGroupId);
+    setSelectedTool(toolId);
+    setOptionValues(defaultsForTool(toolId));
+    setSelectedFiles([]);
+    setFileResults([]);
+    setFileItems([]);
+    setFileError(false);
+    const tool = fileTools.find((item) => item.id === toolId);
+    setFileMessage(tool ? `${tool.title} — sẵn sàng nhận file` : 'Chọn file để bắt đầu.');
+    setActiveTool('files');
+  }
+
+  function applyWorkflow(template: WorkflowTemplate) {
+    if (template.target.tab === 'transcript') {
+      setActiveTool('transcript');
+      pushToast({ variant: 'info', title: 'Workflow đã sẵn sàng', detail: template.title });
+      return;
+    }
+    if (template.target.tab === 'media') {
+      if (template.target.format) setFormat(template.target.format);
+      setActiveTool('media');
+      pushToast({ variant: 'info', title: 'Workflow đã sẵn sàng', detail: template.title });
+      return;
+    }
+    if (template.target.tab === 'files' && template.target.tool) {
+      openFileTool(template.target.tool, template.target.group);
+      pushToast({ variant: 'success', title: 'Đã mở workflow', detail: template.title });
+    }
+  }
+
+  function deleteRecent(jobId: string) {
+    setRecentEntries((current) => {
+      const next = current.filter((entry) => entry.jobId !== jobId);
+      saveRecent(next);
+      return next;
+    });
   }
 
   function canUseTool(tool: FileTool) {
@@ -1443,6 +1702,80 @@ export function App() {
     }
   }
 
+  async function handleTranscriptSubmit(event: FormEvent | { preventDefault: () => void }, overrideLang?: string, useWhisper = false) {
+    event.preventDefault();
+    const url = transcriptUrl.trim();
+    if (!url) {
+      setTranscriptError('Dán URL video trước đã.');
+      return;
+    }
+    const effectiveLang = (overrideLang || transcriptLang || 'auto').trim();
+    setTranscriptBusy(true);
+    setTranscriptError('');
+    setTranscriptResult(null);
+    try {
+      const languages = effectiveLang === 'auto' ? ['vi', 'en'] : [effectiveLang, 'vi', 'en'];
+      const result = await fetchTranscript({ url, languages, useWhisper });
+      setTranscriptResult(result);
+      setTranscriptView('plain');
+      if (result.segments.length === 0) {
+        pushToast({
+          variant: 'info',
+          title: 'Video không có phụ đề sẵn',
+          detail: result.message || 'Cài faster-whisper để fallback transcribe.'
+        });
+      } else {
+        const sourceLabel = result.source === 'manual' ? 'sub thủ công' : result.source === 'auto' ? 'auto-sub' : result.source === 'whisper' ? 'Whisper local' : 'không rõ';
+        pushToast({
+          variant: 'success',
+          title: `Lấy được ${result.segments.length} dòng`,
+          detail: `${sourceLabel} · ${result.languageLabel}`
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Trích script thất bại.';
+      setTranscriptError(message);
+      pushToast({ variant: 'error', title: 'Trích script thất bại', detail: message });
+    } finally {
+      setTranscriptBusy(false);
+    }
+  }
+
+  async function handleTranscriptPaste() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) setTranscriptUrl(text.trim());
+    } catch {
+      setTranscriptError('Trình duyệt không cho phép đọc clipboard. Hãy dán bằng Ctrl+V.');
+    }
+  }
+
+  async function copyToClipboard(text: string, field: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(field);
+      window.setTimeout(() => setCopiedField((current) => (current === field ? '' : current)), 1500);
+    } catch {
+      pushToast({ variant: 'error', title: 'Copy thất bại', detail: 'Trình duyệt từ chối quyền clipboard.' });
+    }
+  }
+
+  function downloadTextFile(filename: string, content: string, mime = 'text/plain;charset=utf-8') {
+    const blob = new Blob([content], { type: mime });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+  }
+
+  function transcriptSafeName(): string {
+    const title = transcriptResult?.video.title || 'transcript';
+    return title.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_').slice(0, 80);
+  }
+
   async function handleNewsSubmit(event: FormEvent) {
     event.preventDefault();
     setNewsBusy(true);
@@ -1582,36 +1915,104 @@ export function App() {
     : healthError || health?.message || 'Đang đọc trạng thái công cụ...';
 
   return (
-    <main className="app-shell">
-      <section className="hero">
-        <div>
-          <div className="brand">
-            <span className="brand-mark" aria-hidden="true">
-              <Wand2 size={24} />
-            </span>
-            <span>Convert URL Studio</span>
-          </div>
-          <h1>Bộ chuyển đổi media, tài liệu.</h1>
-          <p className="hero-copy">
-            Chuyển URL sang MP4/MP3, Excel sang JSON/XML/CSV, JSON/XML/CSV sang Excel, Word sang PDF và PDF sang Word.
-            Backend xử lý bằng Node, yt-dlp, ffmpeg, ExcelJS và LibreOffice khi có sẵn.
-          </p>
-        </div>
-
-        <div className="health-card" aria-live="polite">
-          <div className={`health-dot ${ready ? 'ready' : health || healthError ? 'missing' : ''}`} />
-          <div>
-            <strong>{ready ? 'Sẵn sàng' : health || healthError ? 'Cần kiểm tra' : 'Đang kiểm tra'}</strong>
-            <span>{healthMessage}</span>
+    <div className="forge-shell">
+      {/* ============ Sidebar ============ */}
+      <aside className="forge-sidebar">
+        <div className="forge-workspace">
+          <span className="forge-brand-mark" aria-hidden="true">
+            <Wand2 size={18} />
+          </span>
+          <div className="forge-workspace-name">
+            <strong>Forge Studio</strong>
+            <small>Personal workspace</small>
           </div>
         </div>
-      </section>
 
-      <div className="tool-tabs" role="tablist" aria-label="Nhóm công cụ">
+        <nav className="forge-nav" aria-label="Navigation">
+          <div className="forge-nav-section">Workflow</div>
+          <button type="button" className={`forge-nav-item ${activeTool === 'media' ? 'active' : ''}`} onClick={() => setActiveTool('media')}>
+            <Link2 size={17} />
+            <span>Media URL</span>
+          </button>
+          <button type="button" className={`forge-nav-item ${activeTool === 'files' ? 'active' : ''}`} onClick={() => setActiveTool('files')}>
+            <FileSpreadsheet size={17} />
+            <span>File Tools</span>
+          </button>
+          <button type="button" className={`forge-nav-item ${activeTool === 'transcript' ? 'active' : ''}`} onClick={() => setActiveTool('transcript')}>
+            <Mic size={17} />
+            <span>Transcript</span>
+          </button>
+
+          <div className="forge-nav-section">Studio</div>
+          <button type="button" className={`forge-nav-item ${activeTool === 'lab' ? 'active' : ''}`} onClick={() => setActiveTool('lab')}>
+            <Sparkles size={17} />
+            <span>AI Lab</span>
+            <em className="forge-nav-badge forge-nav-badge-new">New</em>
+          </button>
+          <button type="button" className={`forge-nav-item ${activeTool === 'workflows' ? 'active' : ''}`} onClick={() => setActiveTool('workflows')}>
+            <Settings2 size={17} />
+            <span>Workflows</span>
+            <em className="forge-nav-badge forge-nav-badge-count">6</em>
+          </button>
+          <button type="button" className={`forge-nav-item ${activeTool === 'library' ? 'active' : ''}`} onClick={() => setActiveTool('library')}>
+            <Archive size={17} />
+            <span>Library</span>
+            {recentEntries.length > 0 ? <em className="forge-nav-badge forge-nav-badge-count">{recentEntries.length}</em> : null}
+          </button>
+        </nav>
+
+        <div className="forge-usage">
+          <div className="forge-usage-label">
+            <span>Usage này tháng</span>
+            <span>247/500</span>
+          </div>
+          <div className="forge-usage-bar"><div style={{ width: '49.4%' }} /></div>
+          <div className="forge-usage-meta">Free tier · còn 253 conversions</div>
+          <button type="button" className="forge-usage-upgrade">
+            <Sparkles size={13} /> Upgrade to Pro
+          </button>
+        </div>
+      </aside>
+
+      {/* ============ Main area ============ */}
+      <div className="forge-main">
+        <header className="forge-topbar">
+          <div className="forge-breadcrumb">
+            <strong>Forge Studio</strong>
+            <Clock size={11} />
+            <span>{activeTool === 'media' ? 'Media URL' : activeTool === 'files' ? 'File Tools' : activeTool === 'transcript' ? 'Transcript' : activeTool === 'lab' ? 'AI Lab' : activeTool === 'workflows' ? 'Workflows' : activeTool === 'library' ? 'Library' : 'Dashboard'}</span>
+          </div>
+
+          <button type="button" className="forge-cmdk">
+            <Search size={14} />
+            <span>Search or jump to…</span>
+            <span className="forge-cmdk-kbd">⌘K</span>
+          </button>
+
+          <div className="forge-topbar-actions">
+            <button type="button" className="forge-icon-btn" title="Notifications" aria-label="Notifications">
+              <AlertTriangle size={17} />
+              <span className="forge-notification-dot" />
+            </button>
+            <button type="button" className="forge-icon-btn" title={ready ? 'Hệ thống sẵn sàng' : 'Cần kiểm tra'} aria-label="Health">
+              <CheckCircle2 size={17} style={{ color: ready ? 'var(--forge-success)' : 'var(--forge-warning)' }} />
+            </button>
+            <div className="forge-avatar" title="Đạt">Đ</div>
+          </div>
+        </header>
+
+        <div className="forge-canvas">
+          {/* OLD app-shell content rendered inside Forge canvas */}
+          <div className="app-shell" style={{ width: '100%', maxWidth: '100%', padding: 0, margin: 0 }}>
+
+      <div className="tool-tabs" role="tablist" aria-label="Nhóm công cụ" style={{ display: 'none' }}>
+        {/* Tabs now in sidebar — old tabs kept hidden as state controller */}
+        {false && (
         <button type="button" className={activeTool === 'content' ? 'active' : ''} onClick={() => setActiveTool('content')}>
           <Newspaper size={18} />
           Content Studio
         </button>
+        )}
         <button type="button" className={activeTool === 'media' ? 'active' : ''} onClick={() => setActiveTool('media')}>
           <Link2 size={18} />
           Media URL
@@ -1619,6 +2020,10 @@ export function App() {
         <button type="button" className={activeTool === 'files' ? 'active' : ''} onClick={() => setActiveTool('files')}>
           <FileSpreadsheet size={18} />
           File Tools
+        </button>
+        <button type="button" className={activeTool === 'transcript' ? 'active' : ''} onClick={() => setActiveTool('transcript')}>
+          <Mic size={18} />
+          Trích Script
         </button>
       </div>
 
@@ -1866,131 +2271,752 @@ export function App() {
           </aside>
           </section>
         </>
-      ) : activeTool === 'media' ? (
-        <section className="workspace">
-          <form className="converter-panel" onSubmit={handleMediaSubmit}>
-            <div className="field">
-              <label htmlFor="urlInput">URL video</label>
-              <div className="input-action">
-                <input
-                  id="urlInput"
-                  type="url"
-                  placeholder="Dán link YouTube hoặc TikTok..."
-                  autoComplete="off"
-                  value={url}
-                  onChange={(event) => setUrl(event.target.value)}
-                  required
-                />
-                <button className="icon-button" type="button" title="Dán từ clipboard" aria-label="Dán từ clipboard" onClick={handlePaste}>
-                  <Clipboard size={21} />
-                </button>
-              </div>
-            </div>
+      ) : activeTool === 'transcript' ? (
+        <section className="forge-transcript-section">
+          {/* HERO */}
+          <div className="forge-media-hero">
+            <span className="forge-eyebrow"><Mic size={12} /> Transcript Extractor</span>
+            <h1 className="forge-h1">
+              Trích script từ <em>bất kỳ video</em>
+            </h1>
+            <p className="forge-subhead">
+              Lấy phụ đề YouTube/TikTok/Vimeo, hoặc dùng Whisper AI transcribe local khi không có sub. Tự nhận diện loại nội dung — music, talk, tutorial, news.
+            </p>
+          </div>
 
-            <div className="field">
-              <label>Định dạng</label>
-              <div className="segmented" role="tablist" aria-label="Định dạng xuất file">
-                <button type="button" className={format === 'mp4' ? 'active' : ''} onClick={() => setFormat('mp4')}>
-                  MP4
-                </button>
-                <button type="button" className={format === 'mp3' ? 'active' : ''} onClick={() => setFormat('mp3')}>
-                  MP3
-                </button>
-              </div>
-            </div>
-
-            <div className="settings-grid">
-              <div className="field">
-                <label htmlFor="qualitySelect">Chất lượng</label>
-                <select id="qualitySelect" value={quality} onChange={(event) => setQuality(event.target.value)} disabled={format === 'mp3'}>
-                  <option value="best">Tốt nhất</option>
-                  <option value="2160">2160p</option>
-                  <option value="1440">1440p</option>
-                  <option value="1080">1080p</option>
-                  <option value="720">720p</option>
-                  <option value="480">480p</option>
-                  <option value="360">360p</option>
-                </select>
-              </div>
-
-              <div className="field">
-                <label htmlFor="playlistSelect">Phạm vi</label>
-                <select id="playlistSelect" value={playlist} onChange={(event) => setPlaylist(event.target.value as CreateJobPayload['playlist'])}>
-                  <option value="single">Một video</option>
-                  <option value="playlist">Playlist nếu có</option>
-                </select>
-              </div>
-
-              <div className="field">
-                <label htmlFor="filenameSelect">Tên file</label>
-                <select id="filenameSelect" value={filename} onChange={(event) => setFilename(event.target.value as CreateJobPayload['filename'])}>
-                  <option value="title">Tiêu đề + ID</option>
-                  <option value="id">Chỉ ID</option>
-                </select>
-              </div>
-            </div>
-
-            <label className={`switch-row ${format === 'mp3' ? 'disabled' : ''}`} htmlFor="compatibilityToggle">
+          <form onSubmit={handleTranscriptSubmit}>
+            <div className="forge-url-input-wrap">
+              <Mic size={20} className="forge-url-icon" />
               <input
-                id="compatibilityToggle"
-                type="checkbox"
-                checked={compatibility}
-                disabled={format === 'mp3'}
-                onChange={(event) => setCompatibility(event.target.checked)}
+                type="url"
+                className="forge-url-input"
+                placeholder="https://www.youtube.com/watch?v=…"
+                autoComplete="off"
+                value={transcriptUrl ?? ''}
+                onChange={(event) => setTranscriptUrl(event.target.value)}
+                required
               />
-              <span className="switch-ui" aria-hidden="true" />
-              <span>
-                <strong>MP4 tương thích cao</strong>
-                <small>Chuẩn hóa sang H.264/AAC để mở tốt trên Windows, điện thoại và trình duyệt.</small>
-              </span>
-            </label>
-
-            <div className="notice">
-              <AlertTriangle size={20} />
-              <span>Chỉ chuyển đổi nội dung bạn sở hữu, có giấy phép, hoặc được tác giả cho phép.</span>
+              <button className="forge-url-paste" type="button" onClick={handleTranscriptPaste} title="Dán từ clipboard">
+                <Clipboard size={14} /> Paste
+              </button>
             </div>
 
-            <button className="primary-button" type="submit" disabled={busy || !ready}>
-              {busy ? <Loader2 className="spin" size={21} /> : <Download size={21} />}
-              {busy ? 'Đang xử lý...' : 'Bắt đầu chuyển đổi'}
+            <div className="forge-options-grid" style={{ gridTemplateColumns: '1fr 1fr', maxWidth: 720 }}>
+              <div className="forge-option-card">
+                <div className="forge-option-head">
+                  <span className="forge-option-label">Ngôn ngữ ưu tiên</span>
+                  <span className="forge-option-icon"><Languages size={16} /></span>
+                </div>
+                <select className="forge-select" value={transcriptLang ?? 'auto'} onChange={(event) => setTranscriptLang(event.target.value)}>
+                  <option value="auto">Tự động (vi → en)</option>
+                  <option value="vi">Tiếng Việt</option>
+                  <option value="en">English</option>
+                  <option value="ja">日本語 Japanese</option>
+                  <option value="ko">한국어 Korean</option>
+                  <option value="zh">中文 Chinese</option>
+                  <option value="fr">Français</option>
+                  <option value="es">Español</option>
+                  <option value="de">Deutsch</option>
+                  <option value="th">ไทย Thai</option>
+                </select>
+              </div>
+              <div className="forge-option-card">
+                <div className="forge-option-head">
+                  <span className="forge-option-label">Pipeline</span>
+                  <span className="forge-option-icon"><Sparkles size={16} /></span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderRadius: 10, background: 'var(--forge-surface-alt)', fontSize: 13 }}>
+                  <span style={{ color: 'var(--forge-success)' }}>●</span>
+                  <span style={{ color: 'var(--forge-ink)' }}>yt-dlp sub</span>
+                  <span style={{ color: 'var(--forge-muted-soft)' }}>→</span>
+                  <span style={{ color: health?.whisperReady ? 'var(--forge-success)' : 'var(--forge-muted-soft)' }}>●</span>
+                  <span style={{ color: health?.whisperReady ? 'var(--forge-ink)' : 'var(--forge-muted)' }}>Whisper {health?.whisperReady ? '✓' : '(off)'}</span>
+                </div>
+                {!health?.whisperReady ? (
+                  <small style={{ fontSize: 11.5, color: 'var(--forge-muted)' }}>
+                    Cài: <code style={{ fontFamily: 'JetBrains Mono, monospace' }}>pip install faster-whisper-cli</code>
+                  </small>
+                ) : null}
+              </div>
+            </div>
+
+            <button className="forge-cta" type="submit" disabled={transcriptBusy || !transcriptUrl.trim()}>
+              {transcriptBusy ? <Loader2 className="spin" size={18} /> : <Mic size={18} />}
+              {transcriptBusy ? 'Đang trích script…' : 'Lấy script ngay'}
+            </button>
+
+            {transcriptError ? (
+              <div className="forge-notice danger" style={{ maxWidth: 720, margin: '16px auto 0' }}>
+                <AlertTriangle size={16} />
+                <span>{transcriptError}</span>
+              </div>
+            ) : null}
+          </form>
+
+          {/* RESULTS */}
+          {transcriptResult ? (
+            <div className="forge-transcript-results">
+              {/* MAIN — transcript content */}
+              <div className="forge-transcript-main">
+                <div className="forge-transcript-toolbar">
+                  <div className="forge-segmented">
+                    {([
+                      { value: 'plain' as const, label: 'Văn bản' },
+                      { value: 'timeline' as const, label: 'Timeline' },
+                      { value: 'markdown' as const, label: 'Markdown' },
+                      { value: 'srt' as const, label: 'SRT' }
+                    ]).map((tab) => (
+                      <button
+                        key={tab.value}
+                        type="button"
+                        className={transcriptView === tab.value ? 'active' : ''}
+                        onClick={() => setTranscriptView(tab.value)}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="forge-action-row">
+                    <button
+                      type="button"
+                      className="forge-action-btn"
+                      onClick={() => copyToClipboard(
+                        transcriptView === 'srt' ? transcriptResult.srt :
+                        transcriptView === 'markdown' ? transcriptResult.paragraphsMarkdown :
+                        transcriptView === 'timeline' ? transcriptResult.segments.map((s) => `[${s.startLabel}] ${s.text}`).join('\n') :
+                        transcriptResult.plainText,
+                        'view'
+                      )}
+                    >
+                      {copiedField === 'view' ? <ClipboardCheck size={13} /> : <Clipboard size={13} />}
+                      {copiedField === 'view' ? 'Đã copy' : 'Copy'}
+                    </button>
+                    <button type="button" className="forge-action-btn" onClick={() => downloadTextFile(`${transcriptSafeName()}.txt`, transcriptResult.plainText)}>
+                      <Download size={13} /> .txt
+                    </button>
+                    <button type="button" className="forge-action-btn" onClick={() => downloadTextFile(`${transcriptSafeName()}.srt`, transcriptResult.srt)}>
+                      <Download size={13} /> .srt
+                    </button>
+                    <button type="button" className="forge-action-btn" onClick={() => downloadTextFile(`${transcriptSafeName()}.vtt`, transcriptResult.vtt, 'text/vtt;charset=utf-8')}>
+                      <Download size={13} /> .vtt
+                    </button>
+                    <button type="button" className="forge-action-btn" onClick={() => downloadTextFile(`${transcriptSafeName()}.md`, transcriptResult.paragraphsMarkdown, 'text/markdown;charset=utf-8')}>
+                      <Download size={13} /> .md
+                    </button>
+                  </div>
+                </div>
+
+                <div className="forge-transcript-content">
+                  {transcriptResult.segments.length === 0 ? (
+                    <div style={{ padding: '40px 24px', textAlign: 'center', color: 'var(--forge-muted)' }}>
+                      <AlertTriangle size={28} style={{ color: 'var(--forge-warning)' }} />
+                      <div style={{ fontWeight: 600, marginTop: 8, color: 'var(--forge-ink)' }}>Video không có phụ đề</div>
+                      <div style={{ marginTop: 4, fontSize: 13 }}>{transcriptResult.message || 'Cần cài faster-whisper để transcribe.'}</div>
+                    </div>
+                  ) : transcriptView === 'plain' ? (
+                    <pre className="forge-transcript-text">{transcriptResult.plainText}</pre>
+                  ) : transcriptView === 'markdown' ? (
+                    <pre className="forge-transcript-text mono">{transcriptResult.paragraphsMarkdown}</pre>
+                  ) : transcriptView === 'srt' ? (
+                    <pre className="forge-transcript-text mono">{transcriptResult.srt}</pre>
+                  ) : (
+                    <ol className="forge-timeline">
+                      {transcriptResult.segments.map((segment) => (
+                        <li key={segment.index}>
+                          <a
+                            href={`${transcriptResult.video.webpageUrl}${transcriptResult.video.webpageUrl.includes('?') ? '&' : '?'}t=${Math.floor(segment.startSeconds)}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="forge-timeline-ts"
+                            title="Mở đúng đoạn này trên video gốc"
+                          >
+                            {segment.startLabel}
+                          </a>
+                          <span>{segment.text}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              </div>
+
+              {/* SIDE — video meta + actions */}
+              <aside className="forge-transcript-side">
+                <div className="forge-video-card">
+                  <div className="forge-video-thumb">
+                    {transcriptResult.video.thumbnail ? (
+                      <img src={transcriptResult.video.thumbnail} alt="" />
+                    ) : (
+                      <div className="forge-video-thumb-fallback"><Mic size={48} /></div>
+                    )}
+                  </div>
+                  <div className="forge-video-body">
+                    <div className="forge-video-title">{transcriptResult.video.title}</div>
+                    <div className="forge-video-meta">
+                      <span><Clock size={12} /> {transcriptResult.video.durationLabel}</span>
+                      {transcriptResult.video.uploader ? <span>· {transcriptResult.video.uploader}</span> : null}
+                      <span>· {transcriptResult.video.host}</span>
+                    </div>
+                  </div>
+                  <div className="forge-badge-stack">
+                    <span className={`forge-badge content-${transcriptResult.video.contentType}`}>
+                      {transcriptResult.video.contentTypeLabel}
+                    </span>
+                    {transcriptResult.segments.length > 0 ? (
+                      <span className="forge-badge count">{transcriptResult.segments.length} dòng</span>
+                    ) : null}
+                    <span className="forge-badge lang">{transcriptResult.languageLabel}</span>
+                    <span className={`forge-badge source-${transcriptResult.source}`}>
+                      {transcriptResult.source === 'manual' ? 'Sub thủ công' :
+                        transcriptResult.source === 'auto' ? 'Auto-sub (ASR)' :
+                        transcriptResult.source === 'whisper' ? 'Whisper local ✓' : 'Không có sub'}
+                    </span>
+                  </div>
+                </div>
+
+                {transcriptResult.qualityWarning ? (
+                  <div className={`forge-notice ${transcriptResult.video.contentType === 'music' && transcriptResult.source === 'auto' ? 'danger' : 'warning'}`}>
+                    <AlertTriangle size={16} />
+                    <span>{transcriptResult.qualityWarning}</span>
+                  </div>
+                ) : null}
+
+                {transcriptResult.warning ? (
+                  <div className="forge-notice info">
+                    <Sparkles size={16} />
+                    <span>{transcriptResult.warning}</span>
+                  </div>
+                ) : null}
+
+                {transcriptResult.source !== 'whisper' && health?.whisperReady ? (
+                  <button
+                    type="button"
+                    className="forge-whisper-cta"
+                    onClick={() => void handleTranscriptSubmit({ preventDefault: () => {} }, undefined, true)}
+                    disabled={transcriptBusy}
+                  >
+                    {transcriptBusy ? <Loader2 className="spin" size={15} /> : <Mic size={15} />}
+                    {transcriptBusy ? 'Đang chạy Whisper…' : 'Re-run với Whisper'}
+                  </button>
+                ) : null}
+
+                {transcriptResult.availableLanguages.length > 1 ? (
+                  <div className="forge-langs">
+                    <strong>Các ngôn ngữ khác có sẵn</strong>
+                    <div className="forge-langs-list">
+                      {transcriptResult.availableLanguages
+                        .filter((lang) => lang.code !== transcriptResult.language)
+                        .slice(0, 24)
+                        .map((lang) => (
+                          <button
+                            key={lang.code}
+                            type="button"
+                            className="forge-lang-chip"
+                            onClick={() => void handleTranscriptSubmit({ preventDefault: () => {} }, lang.code)}
+                            title={`Tải lại với ${lang.label}${lang.auto ? ' (auto)' : ''}`}
+                          >
+                            {lang.code}{lang.auto ? ' ·auto' : ''}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                ) : null}
+              </aside>
+            </div>
+          ) : null}
+        </section>
+      ) : activeTool === 'media' ? (
+        <section className="forge-media-section">
+          {/* HERO */}
+          <div className="forge-media-hero">
+            <span className="forge-eyebrow">
+              <Link2 size={12} /> Media URL Converter
+            </span>
+            <h1 className="forge-h1">
+              Convert any video URL. <em>Beautifully.</em>
+            </h1>
+            <p className="forge-subhead">
+              Dán link YouTube, TikTok, Vimeo, Twitter — chúng tôi xử lý mọi nền tảng. MP4 chất lượng tốt nhất, MP3 audio rõ.
+            </p>
+          </div>
+
+          <form onSubmit={handleMediaSubmit}>
+            {/* GIANT URL INPUT */}
+            <div className="forge-url-input-wrap">
+              <Link2 size={20} className="forge-url-icon" />
+              <input
+                id="urlInput"
+                type="url"
+                className="forge-url-input"
+                placeholder="https://www.youtube.com/watch?v=…"
+                autoComplete="off"
+                value={url ?? ''}
+                onChange={(event) => setUrl(event.target.value)}
+                required
+              />
+              <button
+                className="forge-url-paste"
+                type="button"
+                onClick={handlePaste}
+                title="Dán từ clipboard (Ctrl+V)"
+              >
+                <Clipboard size={14} /> Paste
+              </button>
+            </div>
+
+            <div className="forge-url-examples">
+              <span>Thử với:</span>
+              <button type="button" className="forge-url-example" onClick={() => setUrl('https://www.youtube.com/watch?v=dQw4w9WgXcQ')}>youtube.com</button>
+              <button type="button" className="forge-url-example" onClick={() => setUrl('https://www.tiktok.com/@user/video/123')}>tiktok.com</button>
+              <button type="button" className="forge-url-example" onClick={() => setUrl('https://vimeo.com/76979871')}>vimeo.com</button>
+            </div>
+
+            {/* 3-COLUMN OPTION GRID */}
+            <div className="forge-options-grid">
+              <div className="forge-option-card">
+                <div className="forge-option-head">
+                  <span className="forge-option-label">Định dạng</span>
+                  <span className="forge-option-icon">{format === 'mp4' ? <Download size={16} /> : <Mic size={16} />}</span>
+                </div>
+                <div className="forge-format-toggle">
+                  <button type="button" className={format === 'mp4' ? 'active' : ''} onClick={() => setFormat('mp4')}>
+                    <Download size={14} /> MP4 Video
+                  </button>
+                  <button type="button" className={format === 'mp3' ? 'active' : ''} onClick={() => setFormat('mp3')}>
+                    <Mic size={14} /> MP3 Audio
+                  </button>
+                </div>
+              </div>
+
+              <div className="forge-option-card">
+                <div className="forge-option-head">
+                  <span className="forge-option-label">Chất lượng</span>
+                  <span className="forge-option-icon"><Sparkles size={16} /></span>
+                </div>
+                <select className="forge-select" value={quality ?? 'best'} onChange={(event) => setQuality(event.target.value)} disabled={format === 'mp3'}>
+                  <option value="best">Tốt nhất (auto)</option>
+                  <option value="2160">2160p · 4K</option>
+                  <option value="1440">1440p · QHD</option>
+                  <option value="1080">1080p · Full HD</option>
+                  <option value="720">720p · HD</option>
+                  <option value="480">480p · SD</option>
+                  <option value="360">360p · Mobile</option>
+                </select>
+                <div className="forge-toggle-row">
+                  <small style={{ fontSize: 12, color: 'var(--forge-muted)' }}>MP4 tương thích Windows</small>
+                  <button
+                    type="button"
+                    className={`forge-toggle ${compatibility && format !== 'mp3' ? 'on' : ''}`}
+                    onClick={() => format !== 'mp3' && setCompatibility(!compatibility)}
+                    disabled={format === 'mp3'}
+                    aria-label="MP4 compatibility"
+                  />
+                </div>
+              </div>
+
+              <div className="forge-option-card">
+                <div className="forge-option-head">
+                  <span className="forge-option-label">Phạm vi</span>
+                  <span className="forge-option-icon"><Archive size={16} /></span>
+                </div>
+                <select className="forge-select" value={playlist ?? 'single'} onChange={(event) => setPlaylist(event.target.value as CreateJobPayload['playlist'])}>
+                  <option value="single">Một video</option>
+                  <option value="playlist">Cả playlist</option>
+                </select>
+                <select className="forge-select" value={filename ?? 'title'} onChange={(event) => setFilename(event.target.value as CreateJobPayload['filename'])}>
+                  <option value="title">Tên: Tiêu đề + ID</option>
+                  <option value="id">Tên: Chỉ ID</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="forge-tip">
+              <AlertTriangle size={16} />
+              <span>Chỉ chuyển đổi nội dung bạn sở hữu, có giấy phép, hoặc được tác giả cho phép. Hỗ trợ 1800+ platforms qua yt-dlp.</span>
+            </div>
+
+            <button className="forge-cta" type="submit" disabled={busy || !ready}>
+              {busy ? <Loader2 className="spin" size={18} /> : <Download size={18} />}
+              {busy ? 'Đang xử lý…' : 'Bắt đầu chuyển đổi'}
             </button>
           </form>
 
-          <aside className="status-panel">
-            <div className="panel-head">
-              <div>
-                <span className="eyebrow">Tiến trình</span>
-                <h2>{statusTitle(job)}</h2>
+          {/* PROGRESS / RESULT */}
+          {job.id ? (
+            <div className="forge-progress-card" style={{ marginTop: 40 }}>
+              <div className="forge-progress-head">
+                <div className="forge-progress-thumb">
+                  {job.status === 'completed' ? <CheckCircle2 size={32} style={{ color: 'var(--forge-success)' }} /> :
+                    job.status === 'failed' ? <XCircle size={32} style={{ color: 'var(--forge-danger)' }} /> :
+                    <Loader2 size={32} className="spin" style={{ color: 'var(--forge-primary)' }} />}
+                </div>
+                <div className="forge-progress-info">
+                  <div className="forge-progress-title">{statusTitle(job)}</div>
+                  <div className="forge-progress-meta">
+                    {job.step} · {Math.max(0, Math.min(100, job.progress))}%
+                  </div>
+                </div>
               </div>
-              <span className={`job-badge ${job.status}`}>{job.id ? job.status : 'idle'}</span>
+              <div className="forge-progress-bar-wrap">
+                <div className="forge-progress-stages">
+                  <div className={`forge-progress-stage ${job.progress > 0 ? 'done' : ''}`} />
+                  <div className={`forge-progress-stage ${job.progress >= 25 ? (job.progress >= 50 ? 'done' : 'active') : ''}`} />
+                  <div className={`forge-progress-stage ${job.progress >= 50 ? (job.progress >= 80 ? 'done' : 'active') : ''}`} />
+                  <div className={`forge-progress-stage ${job.progress >= 80 ? (job.progress >= 100 ? 'done' : 'active') : ''}`} />
+                </div>
+                <div className="forge-progress-stage-labels">
+                  <span className={job.progress > 0 ? 'done' : ''}>Khởi tạo</span>
+                  <span className={job.progress >= 25 ? (job.progress >= 50 ? 'done' : 'active') : ''}>Tải xuống</span>
+                  <span className={job.progress >= 50 ? (job.progress >= 80 ? 'done' : 'active') : ''}>Xử lý</span>
+                  <span className={job.progress >= 100 ? 'done' : (job.progress >= 80 ? 'active' : '')}>Hoàn tất</span>
+                </div>
+              </div>
+              {logs && logs !== 'Log sẽ xuất hiện tại đây.' ? (
+                <div className="forge-progress-log" ref={logRef}>
+                  {logs.split('\n').slice(-12).map((line, idx) => <div key={idx}>{line}</div>)}
+                </div>
+              ) : null}
             </div>
+          ) : null}
 
-            <div className="progress-shell">
-              <div className="progress-bar" style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} />
+          {/* DOWNLOADS */}
+          {job.files.length > 0 ? (
+            <div className="forge-downloads">
+              {job.files.map((file) => (
+                <div className="forge-download-card" key={file.downloadUrl}>
+                  <div className="forge-download-icon">
+                    <Download size={20} />
+                  </div>
+                  <div className="forge-download-info">
+                    <div className="forge-download-name">{file.fileName}</div>
+                    <div className="forge-download-meta">{formatBytes(file.size)}</div>
+                  </div>
+                  <div className="forge-download-actions">
+                    <a className="forge-download-btn" href={file.downloadUrl} target="_blank" rel="noreferrer">Mở</a>
+                    <a className="forge-download-btn primary" href={file.downloadUrl} download={file.fileName}>
+                      <Download size={13} /> Tải về
+                    </a>
+                  </div>
+                </div>
+              ))}
             </div>
-            <div className="progress-meta">
-              <span>{job.step}</span>
-              <strong>{Math.max(0, Math.min(100, job.progress))}%</strong>
-            </div>
+          ) : null}
 
-            <DownloadList files={job.files} />
-            <ResultPreview files={job.files} />
-
-            <div className={`log-box ${job.status === 'failed' ? 'error' : ''}`} ref={logRef}>
-              {logs}
+          {job.files.length > 0 ? (
+            <div style={{ maxWidth: 720, margin: '20px auto 0' }}>
+              <ResultPreview files={job.files} />
             </div>
-          </aside>
+          ) : null}
+        </section>
+      ) : activeTool === 'lab' ? (
+        <section className="forge-lab-section">
+          <div className="forge-media-hero" style={{ marginBottom: 32 }}>
+            <span className="forge-eyebrow"><Sparkles size={12} /> AI Lab</span>
+            <h1 className="forge-h1">
+              Lab AI riêng — <em>thử nghiệm</em> sức mạnh
+            </h1>
+            <p className="forge-subhead">
+              Bộ sưu tập công cụ AI nhỏ gọn nhưng chuyên sâu: xoá nền, chroma key, upscale, scan tài liệu, Whisper transcript. Một số tính năng đang lab thử nghiệm — chờ ra mắt.
+            </p>
+          </div>
+
+          {/* Hero highlight strip */}
+          <div className="forge-lab-stats">
+            <div className="forge-lab-stat">
+              <div className="forge-lab-stat-icon emerald"><Sparkles size={18} /></div>
+              <div>
+                <strong>{aiLabCards.filter((c) => c.available).length}</strong>
+                <span>Sẵn sàng dùng</span>
+              </div>
+            </div>
+            <div className="forge-lab-stat">
+              <div className="forge-lab-stat-icon violet"><Wand2 size={18} /></div>
+              <div>
+                <strong>{aiLabCards.filter((c) => !c.available).length}</strong>
+                <span>Đang phát triển</span>
+              </div>
+            </div>
+            <div className="forge-lab-stat">
+              <div className="forge-lab-stat-icon peach"><ShieldCheck size={18} /></div>
+              <div>
+                <strong>100%</strong>
+                <span>Local, không upload</span>
+              </div>
+            </div>
+            <div className="forge-lab-stat">
+              <div className="forge-lab-stat-icon sky"><TrendingUp size={18} /></div>
+              <div>
+                <strong>Free</strong>
+                <span>Không giới hạn</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Cards grid */}
+          <div className="forge-lab-grid">
+            {aiLabCards.map((card) => {
+              const Icon =
+                card.icon === 'eraser' ? Eraser :
+                card.icon === 'palette' ? Palette :
+                card.icon === 'zap' ? Zap :
+                card.icon === 'scan' ? ScanLine :
+                card.icon === 'languages' ? Languages :
+                card.icon === 'mic' ? Mic :
+                card.icon === 'wand' ? Wand2 :
+                card.icon === 'volume' ? Volume2 :
+                Image;
+              const handleClick = () => {
+                if (!card.available) return;
+                if (card.id === 'whisper') {
+                  setActiveTool('transcript');
+                  pushToast({ variant: 'info', title: 'Transcript đã mở', detail: 'Dán link video để bắt đầu' });
+                  return;
+                }
+                if (card.action) {
+                  openFileTool(card.action.tool, card.action.group);
+                  pushToast({ variant: 'success', title: card.title, detail: 'Sẵn sàng nhận file' });
+                }
+              };
+              return (
+                <div
+                  key={card.id}
+                  className={`forge-lab-card accent-${card.accent} ${card.available ? '' : 'is-soon'}`}
+                  role={card.available ? 'button' : undefined}
+                  tabIndex={card.available ? 0 : -1}
+                  onClick={handleClick}
+                  onKeyDown={(e) => { if (card.available && (e.key === 'Enter' || e.key === ' ')) handleClick(); }}
+                >
+                  <div className="forge-lab-card-icon"><Icon size={24} /></div>
+                  <div className="forge-lab-card-body">
+                    <div className="forge-lab-card-tag">{card.tag}</div>
+                    <h3>{card.title}</h3>
+                    <p>{card.description}</p>
+                  </div>
+                  <div className="forge-lab-card-foot">
+                    {card.available ? (
+                      <>
+                        <span className="forge-lab-card-link">
+                          {card.action?.label ?? 'Mở công cụ'} <ArrowRight size={14} />
+                        </span>
+                      </>
+                    ) : (
+                      <span className="forge-lab-card-soon">
+                        <Clock size={13} /> {card.comingSoon ?? 'Sắp ra'}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="forge-lab-cta">
+            <div>
+              <strong>Cần một tính năng AI cụ thể?</strong>
+              <span>Ý tưởng hay đều cân nhắc — đặc biệt nếu chạy được local không cần GPU lớn.</span>
+            </div>
+            <button type="button" className="forge-button" onClick={() => {
+              setActiveTool('files');
+              pushToast({ variant: 'info', title: 'Đã có 28 công cụ', detail: 'Khám phá File Tools' });
+            }}>
+              Xem 28 công cụ <ChevronRight size={14} />
+            </button>
+          </div>
+        </section>
+      ) : activeTool === 'workflows' ? (
+        <section className="forge-workflows-section">
+          <div className="forge-media-hero" style={{ marginBottom: 32 }}>
+            <span className="forge-eyebrow"><Workflow size={12} /> Workflows</span>
+            <h1 className="forge-h1">
+              Template <em>quy trình</em> sẵn — chạy 1 click
+            </h1>
+            <p className="forge-subhead">
+              6 workflow phổ biến nhất, từ trích script YouTube tới đóng PDF hồ sơ. Mỗi template tự chọn đúng tool + format, bạn chỉ cần thả file hoặc dán link.
+            </p>
+          </div>
+
+          <div className="forge-wf-grid">
+            {workflowTemplates.map((tpl) => {
+              const Icon =
+                tpl.icon === 'youtube' ? PlayCircle :
+                tpl.icon === 'image' ? Image :
+                tpl.icon === 'mic' ? Mic :
+                tpl.icon === 'film' ? Film :
+                tpl.icon === 'fileType' ? FileType2 :
+                Workflow;
+              return (
+                <div key={tpl.id} className={`forge-wf-card accent-${tpl.accent}`}>
+                  <div className="forge-wf-card-head">
+                    <div className="forge-wf-card-icon"><Icon size={22} /></div>
+                    {tpl.badge ? <span className="forge-wf-card-badge">{tpl.badge}</span> : null}
+                  </div>
+                  <h3 className="forge-wf-card-title">{tpl.title}</h3>
+                  <p className="forge-wf-card-sub">{tpl.subtitle}</p>
+                  <p className="forge-wf-card-desc">{tpl.description}</p>
+                  <ol className="forge-wf-steps">
+                    {tpl.steps.map((step, idx) => (
+                      <li key={idx}>
+                        <span className="forge-wf-step-num">{idx + 1}</span>
+                        <span>{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                  <button type="button" className="forge-wf-cta" onClick={() => applyWorkflow(tpl)}>
+                    {tpl.cta} <ArrowRight size={14} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="forge-wf-hint">
+            <Star size={14} />
+            <span>Mỗi template tự chuyển tab đúng, chọn sẵn tool và format. Sau khi mở, bạn chỉ cần thả file hoặc dán link là chạy.</span>
+          </div>
+        </section>
+      ) : activeTool === 'library' ? (
+        <section className="forge-library-section">
+          <div className="forge-media-hero" style={{ marginBottom: 32 }}>
+            <span className="forge-eyebrow"><Archive size={12} /> Library</span>
+            <h1 className="forge-h1">
+              Lịch sử <em>conversion</em> — mở lại bất cứ lúc nào
+            </h1>
+            <p className="forge-subhead">
+              Tất cả file đã chuyển đổi gần đây được lưu cục bộ trong trình duyệt. Click để mở lại job với đúng tool và file kết quả.
+            </p>
+          </div>
+
+          <div className="forge-lib-stats">
+            <div className="forge-lib-stat">
+              <div className="forge-lib-stat-icon emerald"><Archive size={20} /></div>
+              <div>
+                <strong>{recentEntries.length}</strong>
+                <span>Job đã lưu</span>
+              </div>
+            </div>
+            <div className="forge-lib-stat">
+              <div className="forge-lib-stat-icon peach"><FileText size={20} /></div>
+              <div>
+                <strong>{recentEntries.reduce((sum, e) => sum + e.files.length, 0)}</strong>
+                <span>File kết quả</span>
+              </div>
+            </div>
+            <div className="forge-lib-stat">
+              <div className="forge-lib-stat-icon violet"><Layers size={20} /></div>
+              <div>
+                <strong>{new Set(recentEntries.map((e) => e.tool)).size}</strong>
+                <span>Loại tool đã dùng</span>
+              </div>
+            </div>
+            <div className="forge-lib-stat">
+              <div className="forge-lib-stat-icon sky"><Clock size={20} /></div>
+              <div>
+                <strong>{recentEntries[0] ? relativeTime(recentEntries[0].createdAt) : '—'}</strong>
+                <span>Job mới nhất</span>
+              </div>
+            </div>
+          </div>
+
+          {recentEntries.length === 0 ? (
+            <div className="forge-lib-empty">
+              <Archive size={42} />
+              <h3>Chưa có lịch sử</h3>
+              <p>Sau khi chuyển đổi file ở tab <strong>File Tools</strong>, job sẽ tự lưu vào đây để bạn mở lại nhanh.</p>
+              <button type="button" className="forge-button" onClick={() => setActiveTool('files')}>
+                <FileSpreadsheet size={14} /> Mở File Tools
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="forge-lib-bar">
+                <div className="forge-lib-bar-meta">
+                  <Filter size={13} /> Hiện {recentEntries.length} job · lưu cục bộ trong trình duyệt
+                </div>
+                <button type="button" className="forge-lib-clear" onClick={clearRecent}>
+                  <Trash2 size={13} /> Xoá toàn bộ lịch sử
+                </button>
+              </div>
+
+              <div className="forge-lib-grid">
+                {recentEntries.map((entry) => (
+                  <div key={entry.jobId} className="forge-lib-card">
+                    <div className="forge-lib-card-head">
+                      <div className="forge-lib-card-tool">
+                        <Wand2 size={13} /> {entry.toolTitle}
+                      </div>
+                      <button
+                        type="button"
+                        className="forge-lib-card-del"
+                        onClick={(e) => { e.stopPropagation(); deleteRecent(entry.jobId); }}
+                        aria-label="Xoá job"
+                        title="Xoá khỏi lịch sử"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                    <div className="forge-lib-card-meta">
+                      <Clock size={11} /> {relativeTime(entry.createdAt)}
+                      <span className="forge-lib-card-sep">·</span>
+                      <FileText size={11} /> {entry.files.length} file
+                    </div>
+                    {entry.inputs.length > 0 ? (
+                      <div className="forge-lib-card-input" title={entry.inputs.join(', ')}>
+                        {entry.inputs[0]}
+                        {entry.inputs.length > 1 ? <em> +{entry.inputs.length - 1}</em> : null}
+                      </div>
+                    ) : null}
+                    <div className="forge-lib-card-files">
+                      {entry.files.slice(0, 3).map((file) => (
+                        <a key={file.downloadUrl} className="forge-lib-card-file" href={file.downloadUrl} download={file.fileName} title={file.fileName} onClick={(e) => e.stopPropagation()}>
+                          <Download size={11} /> {file.fileName}
+                        </a>
+                      ))}
+                      {entry.files.length > 3 ? <span className="forge-lib-card-more">+{entry.files.length - 3} file khác</span> : null}
+                    </div>
+                    <button type="button" className="forge-lib-card-open" onClick={() => applyRecent(entry)}>
+                      Mở lại job <ArrowRight size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </section>
       ) : (
-        <section className="workspace">
-          <form className="converter-panel" onSubmit={handleFileSubmit}>
-            <div className="file-workbench">
-              <div className="group-rail" aria-label="Nhóm file tools">
+        <section className="forge-files-section">
+          <div className="forge-media-hero" style={{ marginBottom: 24 }}>
+            <span className="forge-eyebrow"><FileSpreadsheet size={12} /> File Tools</span>
+            <h1 className="forge-h1">Chuyển đổi file <em>chuẩn xác</em></h1>
+            <p className="forge-subhead">
+              28 công cụ chuyển đổi — Excel, JSON, XML, CSV, ảnh, PDF, Word, AI background removal. Drag & drop nhiều file để batch.
+            </p>
+          </div>
+
+          <div className="forge-files-layout">
+            {/* LEFT RAIL — tool picker */}
+            <aside className="forge-tool-rail">
+              <div className="forge-tool-search">
+                <Search size={16} />
+                <input
+                  type="search"
+                  placeholder="Tìm trong tiện ích..."
+                  value={toolSearch ?? ''}
+                  onChange={(event) => setToolSearch(event.target.value)}
+                  aria-label="Tìm tool"
+                />
+                {toolSearch ? (
+                  <button type="button" className="forge-tool-search-clear" onClick={() => setToolSearch('')} aria-label="Xoá tìm kiếm">
+                    <XCircle size={13} />
+                  </button>
+                ) : null}
+              </div>
+
+              <div className="forge-tool-groups">
                 {toolGroups.map((group) => (
                   <button
                     type="button"
-                    className={activeFileGroup === group.id ? 'active' : ''}
                     key={group.id}
+                    className={`forge-tool-group-tab ${activeFileGroup === group.id ? 'active' : ''}`}
                     onClick={() => {
                       setActiveFileGroup(group.id);
                       const firstTool = group.tools.find((tool) => canUseTool(tool)) || group.tools[0];
@@ -2001,242 +3027,354 @@ export function App() {
                       setFileMessage(toolDisabledReason(firstTool) || firstTool.description);
                     }}
                   >
-                    <strong>{group.title}</strong>
-                    <span>{group.tools.length} tools</span>
+                    {group.title}
+                    <small>{group.tools.length}</small>
                   </button>
                 ))}
               </div>
 
-              <section className="tool-picker">
-                <div className="tool-section-head">
-                  <h3>{currentGroup.title}</h3>
-                  <span>{currentGroup.description}</span>
-                </div>
-
-                <div className="tool-search">
-                  <Search size={16} aria-hidden="true" />
-                  <input
-                    type="search"
-                    placeholder={`Tìm trong ${currentGroup.tools.length} tiện ích...`}
-                    value={toolSearch}
-                    onChange={(event) => setToolSearch(event.target.value)}
-                    aria-label="Tìm tool"
-                  />
-                  {toolSearch ? (
-                    <button type="button" className="tool-search-clear" onClick={() => setToolSearch('')} aria-label="Xoá tìm kiếm">
-                      <XCircle size={14} />
+              <div className="forge-tool-list">
+                {visibleTools.length === 0 ? (
+                  <div className="forge-tool-list-empty">
+                    <Search size={18} />
+                    Không có tool nào khớp "{toolSearch}".
+                  </div>
+                ) : visibleTools.map((tool) => {
+                  const usable = canUseTool(tool);
+                  const disabledReason = toolDisabledReason(tool);
+                  return (
+                    <button
+                      key={tool.id}
+                      type="button"
+                      className={`forge-tool-row ${selectedTool === tool.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setSelectedTool(tool.id);
+                        setSelectedFiles([]);
+                        setFileResults([]);
+                        setFileError(false);
+                        setFileMessage(disabledReason || tool.description);
+                      }}
+                      disabled={!usable}
+                      title={disabledReason || tool.description}
+                    >
+                      <span className="forge-tool-icon-box">
+                        {tool.badge === 'Docs' ? <FileText size={18} /> : tool.badge === 'Image' || tool.badge === 'Scan' || tool.badge === 'AI' ? <Image size={18} /> : <Database size={18} />}
+                      </span>
+                      <span className="forge-tool-info">
+                        <strong>{tool.title}</strong>
+                        <small>{disabledReason || tool.description}</small>
+                      </span>
+                      <em className="forge-tool-badge">{tool.badge}</em>
                     </button>
-                  ) : null}
-                </div>
-
-                <div className="tool-list">
-                  {visibleTools.length === 0 ? (
-                    <div className="tool-list-empty">
-                      <Search size={18} />
-                      Không có tool nào khớp "{toolSearch}".
-                    </div>
-                  ) : visibleTools.map((tool) => {
-                    const usable = canUseTool(tool);
-                    const disabledReason = toolDisabledReason(tool);
-
-                    return (
-                      <button
-                        className={`tool-row ${selectedTool === tool.id ? 'active' : ''}`}
-                        type="button"
-                        key={tool.id}
-                        onClick={() => {
-                          setSelectedTool(tool.id);
-                          setSelectedFiles([]);
-                          setFileResults([]);
-                          setFileError(false);
-                          setFileMessage(disabledReason || tool.description);
-                        }}
-                        disabled={!usable}
-                        title={disabledReason || tool.description}
-                      >
-                        <span className="tool-card-icon">
-                          {tool.badge === 'Docs' ? <FileText size={20} /> : tool.badge === 'Image' || tool.badge === 'Scan' ? <Image size={20} /> : <Database size={20} />}
-                        </span>
-                        <span>
-                          <strong>{tool.title}</strong>
-                          <small>{disabledReason || tool.description}</small>
-                        </span>
-                        <em>{tool.badge}</em>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-            </div>
-
-            <div className="field">
-              <label htmlFor="fileInput">{isScanTool ? 'Ảnh tài liệu hoặc camera' : 'File đầu vào'}</label>
-              <div
-                className={`upload-zone ${isDraggingFile ? 'dragging' : ''} ${selectedFiles.length ? 'has-file' : ''}`}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  setIsDraggingFile(true);
-                }}
-                onDragLeave={() => setIsDraggingFile(false)}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsDraggingFile(false);
-                  selectUploadFiles(event.dataTransfer.files, 'append');
-                }}
-              >
-                <input
-                  ref={fileInputRef}
-                  id="fileInput"
-                  className="sr-only-file"
-                  type="file"
-                  multiple={!isScanTool}
-                  accept={currentTool.accept}
-                  capture={isScanTool ? 'environment' : undefined}
-                  onChange={(event) => selectUploadFiles(event.target.files, 'append')}
-                />
-                <div className="upload-icon" aria-hidden="true">
-                  {isScanTool ? <Camera size={24} /> : <UploadCloud size={24} />}
-                </div>
-                <div className="upload-copy">
-                  <strong>
-                    {selectedFiles.length === 0
-                      ? (isScanTool ? 'Chụp tài liệu hoặc chọn ảnh scan' : 'Kéo thả file vào đây (chọn nhiều file để batch)')
-                      : selectedFiles.length === 1
-                        ? selectedFiles[0].name
-                        : `${selectedFiles.length} file đã sẵn sàng`}
-                  </strong>
-                  <span>
-                    {selectedFiles.length === 0
-                      ? `Định dạng nhận: ${currentTool.accept}`
-                      : selectedFiles.length === 1
-                        ? formatBytes(selectedFiles[0].size)
-                        : `${formatBytes(selectedFiles.reduce((sum, file) => sum + file.size, 0))} tổng cộng`}
-                  </span>
-                </div>
-                <div className="upload-actions">
-                  <button type="button" className="secondary-button" onClick={() => fileInputRef.current?.click()}>
-                    <UploadCloud size={18} />
-                    {selectedFiles.length ? 'Thêm file' : 'Chọn file'}
-                  </button>
-                  {isScanTool ? (
-                    <button type="button" className="secondary-button camera" onClick={openCamera}>
-                      <Camera size={18} />
-                      Camera
-                    </button>
-                  ) : null}
-                  {selectedFiles.length > 0 ? (
-                    <button type="button" className="secondary-button danger" onClick={clearUploadFiles}>
-                      <XCircle size={18} />
-                      Xoá hết
-                    </button>
-                  ) : null}
-                </div>
+                  );
+                })}
               </div>
+            </aside>
 
-              {selectedFiles.length > 0 ? (
-                <ul className="file-chips">
-                  {selectedFiles.map((file, index) => (
-                    <li key={`${file.name}-${index}`} className="file-chip" title={file.name}>
-                      <FileText size={14} aria-hidden="true" />
-                      <span className="chip-name">{file.name}</span>
-                      <small>{formatBytes(file.size)}</small>
-                      <button
-                        type="button"
-                        aria-label={`Bỏ file ${file.name}`}
-                        onClick={() => removeUploadFile(index)}
+            {/* RIGHT MAIN — upload + options + results */}
+            <div className="forge-files-main">
+              <form onSubmit={handleFileSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+                {/* UPLOAD CARD */}
+                <div className="forge-card">
+                  <div className="forge-card-head">
+                    <div className="forge-card-title">
+                      <strong>{currentTool.title}</strong>
+                      <small>{currentTool.description}</small>
+                    </div>
+                    <em className="forge-tool-badge">{currentTool.badge}</em>
+                  </div>
+                  <div className="forge-card-body">
+                    <div
+                      className={`forge-upload-zone ${isDraggingFile ? 'dragging' : ''} ${selectedFiles.length ? 'has-file' : ''}`}
+                      onDragOver={(event) => { event.preventDefault(); setIsDraggingFile(true); }}
+                      onDragLeave={() => setIsDraggingFile(false)}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        setIsDraggingFile(false);
+                        selectUploadFiles(event.dataTransfer.files, 'append');
+                      }}
+                    >
+                      {isScanTool ? (
+                        <input
+                          key="scan-input"
+                          ref={fileInputRef}
+                          id="fileInput"
+                          className="sr-only-file"
+                          type="file"
+                          accept={currentTool.accept || 'image/*'}
+                          capture="environment"
+                          onChange={(event) => selectUploadFiles(event.target.files, 'append')}
+                        />
+                      ) : (
+                        <input
+                          key="multi-input"
+                          ref={fileInputRef}
+                          id="fileInput"
+                          className="sr-only-file"
+                          type="file"
+                          multiple
+                          accept={currentTool.accept || '*/*'}
+                          onChange={(event) => selectUploadFiles(event.target.files, 'append')}
+                        />
+                      )}
+                      <div className="forge-upload-icon" aria-hidden="true">
+                        {isScanTool ? <Camera size={24} /> : <UploadCloud size={24} />}
+                      </div>
+                      <div className="forge-upload-title">
+                        {selectedFiles.length === 0
+                          ? (isScanTool ? 'Chụp tài liệu hoặc chọn ảnh scan' : 'Kéo thả file vào đây')
+                          : selectedFiles.length === 1
+                            ? selectedFiles[0].name
+                            : `${selectedFiles.length} file đã sẵn sàng`}
+                      </div>
+                      <div className="forge-upload-subtitle">
+                        {selectedFiles.length === 0
+                          ? `Định dạng: ${currentTool.accept}${!isScanTool ? ' · chọn nhiều file để batch' : ''}`
+                          : selectedFiles.length === 1
+                            ? formatBytes(selectedFiles[0].size)
+                            : `${formatBytes(selectedFiles.reduce((sum, f) => sum + f.size, 0))} tổng cộng`}
+                      </div>
+                      <div className="forge-upload-actions">
+                        <button type="button" className="forge-button primary" onClick={() => fileInputRef.current?.click()}>
+                          <UploadCloud size={14} />
+                          {selectedFiles.length ? 'Thêm file' : 'Chọn file'}
+                        </button>
+                        {isScanTool ? (
+                          <button type="button" className="forge-button" onClick={openCamera}>
+                            <Camera size={14} /> Camera
+                          </button>
+                        ) : null}
+                        {selectedFiles.length > 0 ? (
+                          <button type="button" className="forge-button danger" onClick={clearUploadFiles}>
+                            <XCircle size={14} /> Xoá hết
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    {selectedFiles.length > 0 ? (
+                      <ul className="forge-file-chips" style={{ listStyle: 'none', padding: 0, margin: '16px 0 0' }}>
+                        {selectedFiles.map((file, index) => (
+                          <li key={`${file.name}-${index}`} className="forge-file-chip" title={file.name}>
+                            <FileText size={13} />
+                            <span className="chip-name">{file.name}</span>
+                            <small>{formatBytes(file.size)}</small>
+                            <button type="button" aria-label={`Bỏ file ${file.name}`} onClick={() => removeUploadFile(index)}>
+                              <Trash2 size={13} />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                </div>
+
+                {/* OPTIONS PANEL */}
+                {toolOptionSpec[currentTool.id] ? (
+                  <div className="forge-options-card">
+                    <details open>
+                      <summary className="forge-options-summary">
+                        <Settings2 size={16} />
+                        <span>Tuỳ chọn nâng cao</span>
+                        {Object.keys(optionValues).some((k) => optionValues[k] !== (toolOptionSpec[currentTool.id]?.find((f) => f.key === k)?.defaultValue)) ? <span className="forge-options-dot" /> : null}
+                        <button type="button" className="forge-options-reset" onClick={(e) => { e.preventDefault(); e.stopPropagation(); resetOptions(); }}>
+                          Mặc định
+                        </button>
+                      </summary>
+                      <div className="forge-options-body">
+                        {(toolOptionSpec[currentTool.id] || []).map((field) => {
+                          const value = optionValues[field.key] ?? field.defaultValue;
+                          if (field.type === 'range') {
+                            const num = Number(value);
+                            const fillPct = Math.round(((num - field.min) / Math.max(1, field.max - field.min)) * 100);
+                            return (
+                              <div key={field.key} className="forge-option-row">
+                                <div className="forge-option-row-head">
+                                  <span>{field.label}</span>
+                                  <strong>{num.toLocaleString('vi-VN')}{field.suffix || ''}</strong>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={field.min}
+                                  max={field.max}
+                                  step={field.step || 1}
+                                  value={num}
+                                  onChange={(e) => setOptionValue(field.key, Number(e.target.value))}
+                                  style={{ ['--range-fill' as string]: `${fillPct}%` }}
+                                />
+                                {field.help ? <small>{field.help}</small> : null}
+                              </div>
+                            );
+                          }
+                          if (field.type === 'number') {
+                            return (
+                              <div key={field.key} className="forge-option-row">
+                                <div className="forge-option-row-head">
+                                  <span>{field.label}</span>
+                                  <strong>{Number(value).toLocaleString('vi-VN')}{field.suffix || ''}</strong>
+                                </div>
+                                <input
+                                  type="number"
+                                  min={field.min}
+                                  max={field.max}
+                                  step={field.step || 1}
+                                  value={Number(value)}
+                                  onChange={(e) => setOptionValue(field.key, Number(e.target.value))}
+                                />
+                                {field.help ? <small>{field.help}</small> : null}
+                              </div>
+                            );
+                          }
+                          if (field.type === 'select') {
+                            return (
+                              <div key={field.key} className="forge-option-row">
+                                <div className="forge-option-row-head"><span>{field.label}</span></div>
+                                <select value={String(value)} onChange={(e) => setOptionValue(field.key, e.target.value)}>
+                                  {field.options.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                                </select>
+                                {field.help ? <small>{field.help}</small> : null}
+                              </div>
+                            );
+                          }
+                          if (field.type === 'color') {
+                            const colorVal = String(value);
+                            return (
+                              <div key={field.key} className="forge-option-row">
+                                <div className="forge-option-row-head">
+                                  <span>{field.label}</span>
+                                  <strong>{colorVal.toUpperCase()}</strong>
+                                </div>
+                                <div className="forge-option-color">
+                                  <input type="color" value={colorVal} onChange={(e) => setOptionValue(field.key, e.target.value)} />
+                                  <input type="text" value={colorVal} onChange={(e) => setOptionValue(field.key, e.target.value)} placeholder="#ffffff" />
+                                </div>
+                                {field.help ? <small>{field.help}</small> : null}
+                              </div>
+                            );
+                          }
+                          if (field.type === 'text') {
+                            return (
+                              <div key={field.key} className="forge-option-row">
+                                <div className="forge-option-row-head"><span>{field.label}</span></div>
+                                <input type="text" value={String(value)} placeholder={field.placeholder} onChange={(e) => setOptionValue(field.key, e.target.value)} />
+                                {field.help ? <small>{field.help}</small> : null}
+                              </div>
+                            );
+                          }
+                          return null;
+                        })}
+                      </div>
+                    </details>
+                  </div>
+                ) : null}
+
+                {/* Dependency notices */}
+                {currentTool.needsLibreOffice && !health?.libreOfficeReady ? (
+                  <div className="forge-notice warning">
+                    <AlertTriangle size={16} />
+                    <span>Tool này cần <strong>LibreOffice</strong>. Cài local hoặc dùng Docker image.</span>
+                  </div>
+                ) : null}
+                {currentTool.needsPdf2Docx && !health?.pdf2docxReady ? (
+                  <div className="forge-notice warning">
+                    <AlertTriangle size={16} />
+                    <span>Tool này cần <strong>pdf2docx</strong>. Cài: <code>python -m pip install pdf2docx</code></span>
+                  </div>
+                ) : null}
+                {currentTool.needsRembg && !health?.rembgReady ? (
+                  <div className="forge-notice warning">
+                    <AlertTriangle size={16} />
+                    <span>Xoá nền AI cần <strong>rembg</strong>. Cài: <code>python -m pip install "rembg[cpu]"</code></span>
+                  </div>
+                ) : null}
+
+                {/* CTA */}
+                <button className="forge-cta" type="submit" disabled={fileBusy || !selectedFiles.length || !canUseTool(currentTool)}>
+                  {fileBusy ? <Loader2 className="spin" size={18} /> : <Download size={18} />}
+                  {fileBusy
+                    ? 'Đang chuyển đổi…'
+                    : selectedFiles.length > 1
+                      ? `Chạy ${currentTool.title} cho ${selectedFiles.length} file`
+                      : `Chạy ${currentTool.title}`}
+                </button>
+
+                {fileMessage && fileMessage !== currentTool.description ? (
+                  <div className={`forge-notice ${fileError ? 'danger' : 'info'}`}>
+                    {fileError ? <XCircle size={16} /> : <CheckCircle2 size={16} />}
+                    <span>{fileMessage}</span>
+                  </div>
+                ) : null}
+              </form>
+
+              {/* RESULTS */}
+              {fileResults.length > 0 ? (
+                <div className="forge-card">
+                  <div className="forge-card-head">
+                    <div className="forge-card-title">
+                      <strong>Kết quả</strong>
+                      <small>{fileResults.length} file đã chuyển đổi</small>
+                    </div>
+                    {fileResults.length > 1 && fileJobId ? (
+                      <a
+                        className="forge-zip-cta"
+                        href={zipUrl(fileJobId, fileResults.map((f) => f.fileName))}
+                        download={`convert-${fileJobId.slice(0, 8)}.zip`}
+                        style={{ padding: '8px 14px', fontSize: 12 }}
                       >
-                        <Trash2 size={14} />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                        <Archive size={14} /> Tải ZIP
+                      </a>
+                    ) : null}
+                  </div>
+                  <div className="forge-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {fileItems && fileItems.length > 1 ? (
+                      fileItems.map((item, idx) => (
+                        <div key={`${item.input}-${idx}`} className={`forge-result-card ${item.error ? 'has-error' : ''}`}>
+                          <div className="forge-result-icon">
+                            {item.error ? <XCircle size={20} /> : <CheckCircle2 size={20} />}
+                          </div>
+                          <div className="forge-result-info">
+                            <strong>{item.input}</strong>
+                            <small>{item.error ? item.error : `${item.files?.length || 0} file output`}</small>
+                          </div>
+                          <div className="forge-result-actions">
+                            {item.files?.map((f) => (
+                              <a key={f.downloadUrl} className="forge-download-btn primary" href={f.downloadUrl} download={f.fileName}>
+                                <Download size={12} />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      fileResults.map((file) => (
+                        <div className="forge-result-card" key={file.downloadUrl}>
+                          <div className="forge-result-icon"><CheckCircle2 size={20} /></div>
+                          <div className="forge-result-info">
+                            <strong>{file.fileName}</strong>
+                            <small>{formatBytes(file.size)}</small>
+                          </div>
+                          <div className="forge-result-actions">
+                            <a className="forge-download-btn" href={file.downloadUrl} target="_blank" rel="noreferrer">Mở</a>
+                            <a className="forge-download-btn primary" href={file.downloadUrl} download={file.fileName}>
+                              <Download size={12} /> Tải
+                            </a>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              ) : null}
+
+              {fileResults.length > 0 ? (
+                <ResultPreview files={fileResults} />
+              ) : null}
+
+              {recentEntries.length > 0 ? (
+                <RecentJobsPanel entries={recentEntries} onPick={applyRecent} onClear={clearRecent} />
               ) : null}
             </div>
-
-            <ToolOptionsPanel
-              tool={currentTool.id}
-              values={optionValues}
-              onChange={setOptionValue}
-              onReset={resetOptions}
-            />
-
-            {currentTool.needsLibreOffice && !health?.libreOfficeReady ? (
-              <div className="notice">
-                <AlertTriangle size={20} />
-                <span>Tool này cần LibreOffice. Render/Docker sẽ có sau khi deploy image mới; máy local cần cài LibreOffice nếu muốn chạy tại chỗ.</span>
-              </div>
-            ) : null}
-
-            {currentTool.needsPdf2Docx && !health?.pdf2docxReady ? (
-              <div className="notice">
-                <AlertTriangle size={20} />
-                <span>Tool này cần pdf2docx để dựng Word có thể chỉnh sửa. Cài local bằng python -m pip install pdf2docx.</span>
-              </div>
-            ) : null}
-
-            {currentTool.needsRembg && !health?.rembgReady ? (
-              <div className="notice">
-                <AlertTriangle size={20} />
-                <span>Tool xoá nền AI cần rembg. Cài local bằng: <code>python -m pip install "rembg[cpu]"</code> (lần đầu chạy sẽ tải model ~25-180MB tuỳ chọn).</span>
-              </div>
-            ) : null}
-
-            <button className="primary-button" type="submit" disabled={fileBusy || !selectedFiles.length || !canUseTool(currentTool)}>
-              {fileBusy ? <Loader2 className="spin" size={21} /> : <Download size={21} />}
-              {fileBusy
-                ? 'Đang chuyển đổi...'
-                : selectedFiles.length > 1
-                  ? `Chạy ${currentTool.title} cho ${selectedFiles.length} file`
-                  : `Chạy ${currentTool.title}`}
-            </button>
-          </form>
-
-          <aside className="status-panel">
-            <div className="panel-head">
-              <div>
-                <span className="eyebrow">File Tools</span>
-                <h2>{currentTool.title}</h2>
-              </div>
-              <span className="job-badge completed">{currentTool.badge}</span>
-            </div>
-
-            <p className={`side-copy ${fileError ? 'error-text' : ''}`}>{fileMessage}</p>
-
-            {fileResults.length > 1 && fileJobId ? (
-              <a
-                className="zip-button"
-                href={zipUrl(fileJobId, fileResults.map((file) => file.fileName))}
-                download={`convert-${fileJobId.slice(0, 8)}.zip`}
-              >
-                <Archive size={18} />
-                Tải tất cả ({fileResults.length} file) thành ZIP
-              </a>
-            ) : null}
-
-            <DownloadGroups items={fileItems} fallback={fileResults} />
-            <ResultPreview files={fileResults} />
-
-            <RecentJobsPanel entries={recentEntries} onPick={applyRecent} onClear={clearRecent} />
-
-            <div className="capability-panel">
-              <strong>Gợi ý mở rộng tiếp theo</strong>
-              <span>Nén PDF, gộp/tách PDF, OCR scan sang searchable PDF, JSON validator, CSV cleaner và batch convert nhiều file.</span>
-            </div>
-
-            <div className={`ai-panel ${health?.openAIReady ? 'ready' : ''}`}>
-              <span className="tool-card-icon" aria-hidden="true">
-                <Sparkles size={20} />
-              </span>
-              <div>
-                <strong>AI Image Studio</strong>
-                <span>
-                  {health?.openAIReady
-                    ? 'OPENAI_API_KEY đã sẵn sàng. Có thể mở rộng tạo ảnh, sửa ảnh bằng prompt, xóa nền và nâng cấp ảnh bằng AI.'
-                    : 'Chưa bật OPENAI_API_KEY. Khi thêm key, có thể gắn GPT Image cho tạo/sửa ảnh bằng prompt, cleanup scan và enhancement thông minh.'}
-                </span>
-              </div>
-            </div>
-          </aside>
+          </div>
         </section>
       )}
 
@@ -2300,6 +3438,9 @@ export function App() {
       ) : null}
 
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
-    </main>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

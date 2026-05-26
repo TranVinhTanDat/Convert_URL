@@ -1,10 +1,11 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 import { appConfig, getApiOrigin } from './src/shared/app-config';
 
 export default defineConfig({
   base: process.env.VITE_BASE_PATH || appConfig.defaultBasePath,
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     host: appConfig.host,
     port: appConfig.webPort,

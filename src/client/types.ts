@@ -10,9 +10,60 @@ export interface HealthResponse {
   libreOfficeReady: boolean;
   pdf2docxReady: boolean;
   rembgReady: boolean;
+  whisperReady: boolean;
   openAIReady: boolean;
   nodeVersion: string;
   message: string;
+}
+
+export interface TranscriptSegment {
+  index: number;
+  startSeconds: number;
+  endSeconds: number;
+  startLabel: string;
+  endLabel: string;
+  text: string;
+}
+
+export type TranscriptContentType = 'music' | 'talk' | 'tutorial' | 'news' | 'vlog' | 'gaming' | 'short' | 'video';
+
+export interface TranscriptVideoMeta {
+  title: string;
+  duration: number;
+  durationLabel: string;
+  uploader: string | null;
+  channel: string | null;
+  uploadDate: string | null;
+  thumbnail: string | null;
+  webpageUrl: string;
+  viewCount: number | null;
+  host: string;
+  contentType: TranscriptContentType;
+  contentTypeLabel: string;
+  categories: string[];
+}
+
+export interface TranscriptLanguageOption {
+  code: string;
+  label: string;
+  auto: boolean;
+}
+
+export interface TranscriptResult {
+  video: TranscriptVideoMeta;
+  language: string;
+  languageLabel: string;
+  source: 'manual' | 'auto' | 'whisper' | 'none';
+  hasSubtitles: boolean;
+  availableLanguages: TranscriptLanguageOption[];
+  segments: TranscriptSegment[];
+  qualityWarning: string | null;
+  plainText: string;
+  paragraphsMarkdown: string;
+  srt: string;
+  vtt: string;
+  message?: string;
+  warning?: string;
 }
 
 export interface ConvertFile {

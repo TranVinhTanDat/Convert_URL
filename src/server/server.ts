@@ -13,6 +13,7 @@ import { PDFParse } from 'pdf-parse';
 import sharp from 'sharp';
 import { appConfig, getApiOrigin } from '../shared/app-config.js';
 import { getNewsStore, publicArticle, refreshNewsFeed, reenrichArticle } from './content-studio/index.js';
+import { fetchTranscriptWithYtdlp, humanizeYtdlpError, TranscriptResult } from './transcript.js';
 
 type OutputFormat = 'mp4' | 'mp3';
 type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
@@ -2653,13 +2654,15 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady, rembgReady] = await Promise.all([
+      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady, rembgReady, fasterWhisperReady, whisperReady] = await Promise.all([
         hasYtdlp(),
         hasCommand('ffmpeg', ['-version'], 5000),
         hasCommand('ffprobe', ['-version'], 5000),
         hasCommand(SOFFICE, libreOfficeHealthArgs(), 12000),
         hasCommand('pdf2docx', ['--help'], 12000),
-        hasCommand('rembg', ['--version'], 8000)
+        hasCommand('rembg', ['--version'], 8000),
+        hasCommand('faster-whisper', ['--help'], 6000),
+        hasCommand('whisper', ['--help'], 6000)
       ]);
 
       sendJson(res, 200, {
@@ -2670,6 +2673,7 @@ const server = http.createServer(async (req, res) => {
         libreOfficeReady,
         pdf2docxReady,
         rembgReady,
+        whisperReady: fasterWhisperReady || whisperReady,
         openAIReady: Boolean(process.env.OPENAI_API_KEY),
         nodeVersion: process.version,
         message: ytdlpReady && ffmpegReady && ffprobeReady ? 'Ready' : 'Missing required tools'
@@ -2680,6 +2684,49 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/content/news-video') {
       const result = await createNewsVideoDraft(await parseBody(req));
       sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/transcript') {
+      const body = await parseBody(req) as { url?: string; languages?: string[]; useWhisper?: boolean };
+      const inputUrl = String(body.url || '').trim();
+      if (!inputUrl) {
+        sendJson(res, 400, { error: 'URL không được trống.' });
+        return;
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(inputUrl);
+      } catch {
+        sendJson(res, 400, { error: 'URL không hợp lệ.' });
+        return;
+      }
+      if (!/^https?:$/.test(parsedUrl.protocol)) {
+        sendJson(res, 400, { error: 'URL phải bắt đầu với http(s)://' });
+        return;
+      }
+
+      const languages = Array.isArray(body.languages) && body.languages.length
+        ? body.languages.map((lang) => String(lang).trim()).filter(Boolean).slice(0, 4)
+        : ['vi', 'en'];
+
+      try {
+        const ytdlpRunner = await resolveYtdlpRunner();
+        const result: TranscriptResult = await fetchTranscriptWithYtdlp(
+          inputUrl,
+          languages,
+          async (args, opts) => run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], opts),
+          DOWNLOAD_DIR,
+          (command, args) => hasCommand(command, args, 6000),
+          { useWhisper: body.useWhisper === true }
+        );
+        sendJson(res, 200, result);
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : 'Trích script thất bại.';
+        const friendly = humanizeYtdlpError(raw);
+        console.error('[transcript] error:', raw.slice(0, 500));
+        sendJson(res, 502, { error: friendly, rawError: raw.slice(0, 800) });
+      }
       return;
     }
 
