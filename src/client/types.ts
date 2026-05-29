@@ -5,15 +5,70 @@ export type NewsVideoStatus = 'pending_approval' | 'ready_for_auto_publish';
 export interface HealthResponse {
   ready: boolean;
   ytdlpReady: boolean;
+  ytdlpCookiesReady?: boolean;
   ffmpegReady: boolean;
   ffprobeReady: boolean;
   libreOfficeReady: boolean;
   pdf2docxReady: boolean;
+  ocrmypdfReady?: boolean;
+  scanOcrReady?: boolean;
   rembgReady: boolean;
   whisperReady: boolean;
+  demucsReady?: boolean;
+  opencvReady?: boolean;
+  lamaReady?: boolean;
   openAIReady: boolean;
   nodeVersion: string;
   message: string;
+}
+
+export interface StemsStem {
+  name: 'vocals' | 'drums' | 'bass' | 'other';
+  label: string;
+  fileName: string;
+  size: number;
+  duration: number;
+  downloadUrl: string;
+  streamUrl: string;
+}
+
+export interface StemsResult {
+  jobId: string;
+  title: string;
+  duration: number;
+  durationLabel: string;
+  thumbnail: string | null;
+  source: 'demucs' | 'spleeter';
+  model: string;
+  stems: StemsStem[];
+  instrumentalUrl: string | null;
+  karaokeUrl: string | null;
+  message?: string;
+  warning?: string;
+}
+
+export interface DetectedObject {
+  id: number;
+  label: string;
+  labelVi: string;
+  confidence: number;
+  bbox: number[]; // [x, y, w, h]
+  areaPct: number;
+  cx: number;
+  cy: number;
+  isMain: boolean;
+  maskUrl: string;
+}
+
+export interface DetectObjectsResult {
+  jobId: string;
+  width: number;
+  height: number;
+  imageUrl: string;
+  mainCount: number;
+  secondaryCount: number;
+  secondaryMaskUrl: string | null;
+  objects: DetectedObject[];
 }
 
 export interface TranscriptSegment {
@@ -117,6 +172,7 @@ export type FileToolId =
   | 'image-metadata'
   | 'scan-document'
   | 'remove-background'
+  | 'remove-object'
   | 'chroma-key'
   | 'crop-image'
   | 'rotate-image'

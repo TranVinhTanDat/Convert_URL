@@ -10,6 +10,7 @@ import type {
   NewsVideoRequest,
   NewsVideoResult,
   PreviewPayload,
+  StemsResult,
   TranscriptResult
 } from './types';
 
@@ -125,6 +126,22 @@ export function approveArticle(id: string): Promise<NewsArticle> {
 
 export function rejectArticle(id: string): Promise<NewsArticle> {
   return request<NewsArticle>(`/api/news/articles/${encodeURIComponent(id)}/reject`, { method: 'POST' });
+}
+
+export function detectObjects(file: File, model?: string): Promise<import('./types').DetectObjectsResult> {
+  const body = new FormData();
+  body.append('tool', 'remove-object');
+  if (model) body.append('options', JSON.stringify({ detectModel: model }));
+  body.append('file', file, file.name);
+  return request<import('./types').DetectObjectsResult>('/api/detect-objects', { method: 'POST', body });
+}
+
+export function separateStems(payload: { url: string; model?: string }): Promise<StemsResult> {
+  return request<StemsResult>('/api/audio/stems', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
 }
 
 export function fetchTranscript(payload: { url: string; languages?: string[]; useWhisper?: boolean }): Promise<TranscriptResult> {

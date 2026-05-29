@@ -410,6 +410,9 @@ export function humanizeYtdlpError(rawMessage: string): string {
   if (lower.includes('429') || lower.includes('too many requests')) {
     return 'YouTube đang rate-limit IP của bạn (HTTP 429). Đợi 2-5 phút rồi thử lại, hoặc đổi sang URL khác.';
   }
+  if (lower.includes('sign in to confirm') && lower.includes('not a bot')) {
+    return 'YouTube dang yeu cau xac minh khong phai bot. Tren Render can cau hinh cookies YouTube cho yt-dlp (YTDLP_COOKIES_BASE64 hoac YTDLP_COOKIES_CONTENT), roi deploy/restart lai.';
+  }
   if (lower.includes('sign in to confirm') || lower.includes('age')) {
     return 'Video bị giới hạn độ tuổi — yt-dlp không lấy được nếu không đăng nhập. Thử URL công khai khác.';
   }

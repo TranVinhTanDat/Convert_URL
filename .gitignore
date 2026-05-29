@@ -3,6 +3,7 @@ dist/
 downloads/
 tmp-test/
 data/content-studio/news.json
+*.pt
 *.log
 npm-debug.log*
 yarn-debug.log*

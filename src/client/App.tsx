@@ -2,30 +2,40 @@ import {
   AlertTriangle,
   Archive,
   ArrowRight,
+  Bell,
+  BookOpen,
   Camera,
   CheckCircle2,
   ChevronRight,
   Clipboard,
   ClipboardCheck,
   Clock,
+  CornerDownLeft,
   Database,
   Download,
   Eraser,
+  ExternalLink,
   FileSpreadsheet,
   FileText,
   FileType2,
   Film,
   Filter,
+  Code2,
+  HelpCircle,
   History,
   Image,
+  Keyboard,
   Languages,
   Layers,
+  LifeBuoy,
   Link2,
   Loader2,
+  LogOut,
   Mic,
   Newspaper,
   Palette,
   PlayCircle,
+  RefreshCw,
   ScanLine,
   Search,
   Send,
@@ -36,6 +46,7 @@ import {
   Trash2,
   TrendingUp,
   UploadCloud,
+  User,
   Volume2,
   Wand2,
   Workflow,
@@ -45,9 +56,11 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   approveArticle,
+  convertFile,
   convertFiles,
   createJob,
   createNewsVideo,
+  detectObjects,
   extractArticle,
   fetchTranscript,
   getHealth,
@@ -56,6 +69,7 @@ import {
   getPreview,
   refreshNews,
   rejectArticle,
+  separateStems,
   zipUrl
 } from './api';
 import type {
@@ -69,9 +83,12 @@ import type {
   NewsArticle,
   NewsVideoRequest,
   NewsVideoResult,
+  DetectObjectsResult,
   OutputFormat,
   PreviewPayload,
   PreviewSheet,
+  StemsResult,
+  StemsStem,
   TranscriptResult
 } from './types';
 
@@ -302,6 +319,74 @@ type OptionField =
   | { type: 'text'; key: string; label: string; help?: string; placeholder?: string; defaultValue: string };
 
 const toolOptionSpec: Partial<Record<FileToolId, OptionField[]>> = {
+  'pdf-to-word': [
+    {
+      type: 'select',
+      key: 'pdfMode',
+      label: 'Kiểu PDF',
+      defaultValue: 'auto',
+      help: 'Auto sẽ dùng OCR khi PDF là bản scan/ảnh, còn PDF có text thật sẽ dùng pdf2docx.',
+      options: [
+        { value: 'auto', label: 'Auto: text thật hoặc scan OCR' },
+        { value: 'editable', label: 'PDF có text thật (pdf2docx)' },
+        { value: 'ocr', label: 'PDF scan / ảnh chụp (OCR)' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'ocrLang',
+      label: 'Ngôn ngữ OCR',
+      defaultValue: 'vie+eng',
+      options: [
+        { value: 'vie+eng', label: 'Tiếng Việt + English (khuyên dùng)' },
+        { value: 'vie', label: 'Chỉ Tiếng Việt' },
+        { value: 'eng', label: 'Chỉ English' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'ocrForce',
+      label: 'Pipeline OCR',
+      defaultValue: 'true',
+      help: 'Force OCR = chạy OCR lại toàn bộ (cho PDF scan thật, giữ table chuẩn). Skip text = chỉ OCR trang chưa có text.',
+      options: [
+        { value: 'true', label: 'Force OCR (full quality, có tables)' },
+        { value: 'false', label: 'Skip text pages (nhanh hơn)' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'ocrDeskew',
+      label: 'Tự nắn ảnh nghiêng',
+      defaultValue: 'true',
+      help: 'Tự xoay/nắn trang bị nghiêng do scan cong, cải thiện OCR + tables.',
+      options: [
+        { value: 'true', label: 'Bật (khuyên dùng)' },
+        { value: 'false', label: 'Tắt' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'ocrClean',
+      label: 'Làm sạch ảnh trước OCR',
+      defaultValue: 'true',
+      options: [
+        { value: 'true', label: 'Bật (clean noise, sắc nét hơn)' },
+        { value: 'false', label: 'Tắt (giữ nguyên scan gốc)' }
+      ]
+    },
+    { type: 'number', key: 'ocrDpi', label: 'Độ nét OCR fallback', help: 'Chỉ dùng khi không có ocrmypdf. 220 = cân bằng; 300 nếu chữ nhỏ.', min: 120, max: 360, step: 20, defaultValue: 220, suffix: ' DPI' },
+    {
+      type: 'select',
+      key: 'pageLabel',
+      label: 'Gắn nhãn trang vào DOCX',
+      defaultValue: 'false',
+      options: [
+        { value: 'false', label: 'Không' },
+        { value: 'true', label: 'Có (--- Trang 1 ---)' }
+      ]
+    }
+  ],
   'image-to-jpeg': [
     { type: 'range', key: 'quality', label: 'Chất lượng', help: 'Cao = ảnh đẹp + file lớn', min: 50, max: 100, defaultValue: 88, suffix: '%' }
   ],
@@ -359,6 +444,44 @@ const toolOptionSpec: Partial<Record<FileToolId, OptionField[]>> = {
         { value: 'isnet-general-use', label: 'IS-Net General (chất lượng cao)' },
         { value: 'isnet-anime', label: 'IS-Net Anime (ảnh vẽ)' }
       ]
+    }
+  ],
+  'remove-object': [
+    {
+      type: 'select',
+      key: 'method',
+      label: 'Engine inpaint',
+      defaultValue: 'auto',
+      options: [
+        { value: 'auto', label: 'Auto LaMa/NS (khuyên dùng)' },
+        { value: 'lama', label: 'AI LaMa' },
+        { value: 'ldm', label: 'AI LDM' },
+        { value: 'telea', label: 'Telea nhanh' },
+        { value: 'ns', label: 'Navier-Stokes' }
+      ]
+    },
+    { type: 'range', key: 'dilate', label: 'Mở rộng mask', min: 0, max: 40, defaultValue: 12, suffix: 'px' },
+    { type: 'range', key: 'feather', label: 'Mềm mép', min: 0, max: 40, defaultValue: 3, suffix: 'px' },
+    {
+      type: 'select',
+      key: 'removeShadow',
+      label: 'Xóa bóng đổ',
+      defaultValue: 'true',
+      options: [{ value: 'true', label: 'Bật' }, { value: 'false', label: 'Tắt' }]
+    },
+    {
+      type: 'select',
+      key: 'removeReflection',
+      label: 'Xóa phản chiếu/glare',
+      defaultValue: 'true',
+      options: [{ value: 'true', label: 'Bật' }, { value: 'false', label: 'Tắt' }]
+    },
+    {
+      type: 'select',
+      key: 'premium',
+      label: 'Hậu kỳ cao cấp',
+      defaultValue: 'true',
+      options: [{ value: 'true', label: 'Bật' }, { value: 'false', label: 'Tắt' }]
     }
   ],
   'chroma-key': [
@@ -895,6 +1018,16 @@ interface ToastMessage {
   detail?: string;
 }
 
+interface NotificationItem {
+  id: number;
+  variant: 'success' | 'error' | 'info' | 'warning';
+  title: string;
+  detail?: string;
+  at: number;
+}
+
+const NOTIF_LIMIT = 30;
+
 function ToastStack({ toasts, onDismiss }: { toasts: ToastMessage[]; onDismiss: (id: number) => void }) {
   if (!toasts.length) return null;
   return (
@@ -928,108 +1061,259 @@ interface RecentEntry {
 
 // ====================== AI Lab + Workflow data ======================
 
+type AILabPreview =
+  | 'portrait' | 'landscape' | 'vintage' | 'beach'
+  | 'palette' | 'crop' | 'text' | 'bilingual'
+  | 'audiobars' | 'voicewave' | 'document';
+
+type AILabCategory = 'image' | 'audio' | 'document';
+
 interface AILabCard {
   id: string;
   title: string;
   description: string;
+  longDescription?: string;
   tag: string;
+  category: AILabCategory;
   accent: 'emerald' | 'peach' | 'violet' | 'sky' | 'rose' | 'amber';
   icon: 'eraser' | 'palette' | 'zap' | 'scan' | 'languages' | 'mic' | 'wand' | 'volume' | 'image';
+  preview: AILabPreview;
   action?: { tool: FileToolId; group: FileGroupId; label: string };
   available: boolean;
   comingSoon?: string;
+  premium?: boolean;
+  popular?: boolean;
+  formats: string[];
+  processTime: string;
+  maxSize: string;
+  tips: string[];
+  relatedIds: string[];
 }
 
 const aiLabCards: AILabCard[] = [
   {
     id: 'remove-bg',
-    title: 'Xoá nền AI',
-    description: 'Tách subject khỏi nền bằng U2Net / IS-Net, xuất PNG trong suốt. Hợp ảnh sản phẩm, chân dung, logo.',
+    title: 'Xoá phông nền',
+    description: 'Tách subject bằng U2Net / IS-Net, xuất PNG trong suốt — hợp ảnh sản phẩm và chân dung.',
+    longDescription: 'Mô hình AI U2Net (mặc định) / IS-Net (chất lượng cao) / Silueta (chân dung) chạy local trong rembg. Output là PNG có alpha channel, sẵn sàng đặt lên background mới.',
     tag: 'Image · AI',
+    category: 'image',
     accent: 'emerald',
     icon: 'eraser',
+    preview: 'portrait',
     action: { tool: 'remove-background', group: 'images', label: 'Mở Xoá nền AI' },
-    available: true
-  },
-  {
-    id: 'chroma',
-    title: 'Chroma Key',
-    description: 'Đổi 1 màu nền đặc (trắng/đen/xanh chroma) thành trong suốt. Auto detect màu góc hoặc chọn HEX tuỳ ý.',
-    tag: 'Image · Studio',
-    accent: 'sky',
-    icon: 'palette',
-    action: { tool: 'chroma-key', group: 'images', label: 'Mở Chroma Key' },
-    available: true
+    available: true,
+    popular: true,
+    formats: ['JPG', 'PNG', 'WebP'],
+    processTime: '~3-5s',
+    maxSize: '20 MB',
+    tips: [
+      'Ảnh nhân vật chính rõ ràng cho kết quả tốt nhất',
+      'IS-Net General chậm hơn nhưng viền tóc / lông mịn hơn',
+      'Sản phẩm nền trắng đôi khi dùng Chroma Key nhanh hơn'
+    ],
+    relatedIds: ['chroma', 'remove-object']
   },
   {
     id: 'upscale',
-    title: 'Upscale 4x',
-    description: 'Phóng ảnh tới 4x bằng Lanczos + làm nét nhẹ. Hợp ảnh nhỏ cần sắc nét cho web hoặc in.',
+    title: 'AI Upscale',
+    description: 'Phóng ảnh 4x bằng Lanczos + sharpen — sắc nét cho web hoặc in ấn.',
+    longDescription: 'Lanczos resampling kết hợp unsharp mask để giữ chi tiết khi phóng to. Hợp ảnh nhỏ < 1000px cần in / chiếu màn hình lớn. Giới hạn cạnh dài 6000px để tránh OOM.',
     tag: 'Image · Enhance',
-    accent: 'violet',
+    category: 'image',
+    accent: 'sky',
     icon: 'zap',
+    preview: 'landscape',
     action: { tool: 'upscale-image', group: 'images', label: 'Mở Upscale' },
-    available: true
+    available: true,
+    popular: true,
+    formats: ['JPG', 'PNG', 'WebP'],
+    processTime: '~1-2s',
+    maxSize: '15 MB',
+    tips: [
+      'Ảnh blurry sẵn không thể "tạo" chi tiết mới',
+      'Chọn 2x cho web, 4x chỉ khi cần in cỡ A3+',
+      'Sau upscale có thể chạy Compress để giảm size'
+    ],
+    relatedIds: ['scan-doc', 'crop']
   },
   {
     id: 'scan-doc',
-    title: 'Scan tài liệu',
-    description: 'Làm sạch ảnh chụp giấy: xoay theo metadata, xám hoá, tăng tương phản, sharpen rồi xuất PNG.',
+    title: 'Phục hồi ảnh cũ',
+    description: 'Làm sạch ảnh chụp giấy / phục hồi tài liệu: xoá noise, tăng tương phản, sharpen.',
+    longDescription: 'Pipeline: auto-rotate theo EXIF → grayscale → CLAHE contrast → unsharp mask → export PNG. Cho ảnh chụp giấy bằng điện thoại trở nên dễ đọc như scan.',
     tag: 'Document · Scan',
+    category: 'document',
     accent: 'amber',
     icon: 'scan',
+    preview: 'vintage',
     action: { tool: 'scan-document', group: 'images', label: 'Mở Scan' },
-    available: true
+    available: true,
+    formats: ['JPG', 'PNG', 'HEIC'],
+    processTime: '~2s',
+    maxSize: '25 MB',
+    tips: [
+      'Chụp ảnh giấy phẳng, ánh sáng đều cho kết quả best',
+      'Nếu chữ vẫn mờ, kết hợp Upscale 2x trước khi scan',
+      'PDF nhiều trang: dùng PDF → PNG rồi scan từng trang'
+    ],
+    relatedIds: ['upscale', 'remove-object']
+  },
+  {
+    id: 'remove-object',
+    title: 'Xoá vật thể',
+    description: 'Tự động phát hiện chủ thể hoặc vẽ vùng cần xoá — AI inpaint lấp ngay với context xung quanh.',
+    longDescription: 'Pipeline 2-step: rembg phát hiện chủ thể (hoặc bạn vẽ thủ công bằng brush tool), sau đó OpenCV inpaint (Telea / Navier-Stokes) lấp lại vùng đã xoá bằng pixel context xung quanh. Phù hợp xoá người, vật thể nhỏ-trung khỏi ảnh phong cảnh.',
+    tag: 'Image · AI Inpaint',
+    category: 'image',
+    accent: 'rose',
+    icon: 'wand',
+    preview: 'beach',
+    action: { tool: 'remove-object', group: 'images', label: 'Mở Xoá vật thể' },
+    available: true,
+    formats: ['JPG', 'PNG', 'WebP'],
+    processTime: '~5-10s',
+    maxSize: '20 MB',
+    tips: [
+      'Auto detect: phù hợp với 1 chủ thể chính (người, sản phẩm) trên nền phong cảnh',
+      'Manual brush: chính xác hơn cho nhiều vật thể nhỏ rải rác',
+      'Vật thể quá lớn (>40% ảnh) sẽ để lại vết mờ — không nên xoá'
+    ],
+    relatedIds: ['remove-bg', 'scan-doc']
+  },
+  {
+    id: 'chroma',
+    title: 'Chuyển đổi phong cách',
+    description: 'Chroma key đổi 1 màu nền đặc thành trong suốt. Auto detect màu góc hoặc HEX tuỳ ý.',
+    longDescription: 'Phù hợp ảnh studio nền trắng / xanh chroma / đen. Nhanh hơn AI rembg cho trường hợp nền đặc. Có 2 mode: auto (lấy trung bình 4 góc) hoặc HEX tuỳ chỉnh.',
+    tag: 'Image · Studio',
+    category: 'image',
+    accent: 'emerald',
+    icon: 'palette',
+    preview: 'palette',
+    action: { tool: 'chroma-key', group: 'images', label: 'Mở Chroma Key' },
+    available: true,
+    formats: ['JPG', 'PNG'],
+    processTime: '<1s',
+    maxSize: '20 MB',
+    tips: [
+      'Logo nền trắng → chroma nhanh hơn rembg 10x',
+      'Ảnh người trên xanh lá (greenscreen) → tăng tolerance',
+      'Đảo lại: chroma key chỉ giữ subject 1 màu'
+    ],
+    relatedIds: ['remove-bg', 'crop']
+  },
+  {
+    id: 'crop',
+    title: 'Cắt ảnh thông minh',
+    description: 'Crop theo tỉ lệ chuẩn (vuông, 16:9, 4:3, 3:2) hoặc kích thước tuỳ chỉnh, giữ trung tâm.',
+    longDescription: 'Tỉ lệ preset: 1:1 (Instagram), 16:9 (YouTube), 4:5 (Reel), 9:16 (Story), 3:2 (DSLR), 4:3 (sách). Crop xung quanh trung tâm hoặc chọn 9 vị trí (góc / mép / center).',
+    tag: 'Image · Edit',
+    category: 'image',
+    accent: 'violet',
+    icon: 'image',
+    preview: 'crop',
+    action: { tool: 'crop-image', group: 'images', label: 'Mở Crop' },
+    available: true,
+    formats: ['JPG', 'PNG', 'WebP'],
+    processTime: '<1s',
+    maxSize: '30 MB',
+    tips: [
+      'Instagram post = 1:1, Reel = 9:16 dọc',
+      'Sau crop có thể chạy Resize để xuống size chuẩn',
+      'Crop center thường an toàn — chủ thể ở giữa ảnh'
+    ],
+    relatedIds: ['upscale', 'chroma']
   },
   {
     id: 'whisper',
-    title: 'Whisper Transcript',
-    description: 'Trích script video bằng AI Whisper local. Hỗ trợ YouTube karaoke, TikTok, Vimeo — kèm timestamp.',
+    title: 'Tách nhạc & lời',
+    description: 'Trích script video bằng AI Whisper local — YouTube karaoke, TikTok, Vimeo, kèm timestamp.',
+    longDescription: 'Pipeline: yt-dlp lấy phụ đề có sẵn → fallback faster-whisper AI nếu video không có sub. Hỗ trợ karaoke tag <c> của YouTube — không bị lặp lyric. Xuất TXT / SRT / VTT / MD.',
     tag: 'Audio · Whisper',
-    accent: 'peach',
+    category: 'audio',
+    accent: 'emerald',
     icon: 'mic',
+    preview: 'audiobars',
     action: { tool: 'remove-background', group: 'images', label: 'Mở Transcript' },
-    available: true
+    available: true,
+    popular: true,
+    formats: ['YouTube', 'TikTok', 'Vimeo', 'MP3'],
+    processTime: '~30-60s',
+    maxSize: '~30 phút',
+    tips: [
+      'Video có sub sẵn → tải sub trực tiếp (nhanh, miễn phí)',
+      'Music video nhiều noise → tăng Whisper model size',
+      'Karaoke YouTube được parse tag <c> tự động'
+    ],
+    relatedIds: ['voice-clone', 'caption']
   },
   {
-    id: 'metadata',
-    title: 'Xoá Metadata',
-    description: 'Loại EXIF/metadata nhạy cảm (GPS, máy ảnh, ngày chụp) trước khi chia sẻ ảnh ra công khai.',
-    tag: 'Privacy · Image',
-    accent: 'rose',
-    icon: 'wand',
-    action: { tool: 'strip-metadata', group: 'images', label: 'Mở công cụ' },
-    available: true
+    id: 'caption',
+    title: 'Tạo mô tả ảnh',
+    description: 'Sinh caption tự động + alt-text cho ảnh sản phẩm bằng AI vision. Đang phát triển.',
+    longDescription: 'Sẽ dùng vision LLM local (LLaVA / Florence-2) để mô tả ảnh, phục vụ alt-text SEO, mô tả sản phẩm e-commerce, accessibility. Output Markdown + JSON structured.',
+    tag: 'AI · Soon',
+    category: 'image',
+    accent: 'peach',
+    icon: 'languages',
+    preview: 'text',
+    available: false,
+    comingSoon: 'Q3 2026',
+    formats: ['JPG', 'PNG'],
+    processTime: '~5-8s',
+    maxSize: '10 MB',
+    tips: [
+      'Alt-text auto giúp SEO + accessibility',
+      'Đang chọn model: LLaVA 1.6 hay Florence-2',
+      'Sẽ có chế độ "sản phẩm e-commerce" với giá / màu / chất liệu'
+    ],
+    relatedIds: ['ocr-translate', 'remove-bg']
   },
   {
     id: 'ocr-translate',
-    title: 'OCR + Dịch',
-    description: 'Nhận diện chữ trong ảnh và dịch song ngữ Việt — Anh. Đang phát triển, dự kiến Q3 2026.',
+    title: 'OCR & Dịch thuật',
+    description: 'Nhận diện chữ trong ảnh và dịch song ngữ Anh — Việt. Sắp ra mắt cuối năm.',
+    longDescription: 'OCR bằng PaddleOCR (Vietnamese accurate) → text extraction → fallback dịch via local LLM hoặc Google Translate API. Output side-by-side EN/VI.',
     tag: 'OCR · Soon',
-    accent: 'violet',
+    category: 'document',
+    accent: 'sky',
     icon: 'languages',
+    preview: 'bilingual',
     available: false,
-    comingSoon: 'Q3 2026'
+    comingSoon: 'Q3 2026',
+    formats: ['JPG', 'PNG', 'PDF'],
+    processTime: '~3-5s',
+    maxSize: '15 MB',
+    tips: [
+      'PaddleOCR hỗ trợ tiếng Việt có dấu',
+      'Hợp tài liệu kỹ thuật / sách / menu nước ngoài',
+      'Sẽ có batch mode cho cả thư mục ảnh'
+    ],
+    relatedIds: ['caption', 'scan-doc']
   },
   {
     id: 'voice-clone',
-    title: 'Voice Clone',
-    description: 'Sao chép giọng đọc bằng 30s mẫu, tạo voice over tiếng Việt tự nhiên. Đang lab thử nghiệm.',
-    tag: 'Audio · Soon',
+    title: 'Nhân bản giọng nói',
+    description: 'Sao chép giọng đọc từ 30s mẫu, tạo voice over tiếng Việt tự nhiên. Premium beta.',
+    longDescription: 'XTTS-v2 / F5-TTS — clone giọng người bất kỳ từ 30s sample. Output WAV 24kHz. Yêu cầu sample sạch, không nhạc nền. Có thể chuyển giọng đa ngôn ngữ.',
+    tag: 'Audio · Premium',
+    category: 'audio',
     accent: 'peach',
     icon: 'volume',
+    preview: 'voicewave',
     available: false,
-    comingSoon: 'Q4 2026'
-  },
-  {
-    id: 'style-transfer',
-    title: 'Style Transfer',
-    description: 'Áp style nghệ thuật (van Gogh, Monet, anime) lên ảnh chụp. Đang thử nghiệm với SDXL local.',
-    tag: 'Image · Soon',
-    accent: 'sky',
-    icon: 'image',
-    available: false,
-    comingSoon: 'Beta sắp ra'
+    comingSoon: 'Premium',
+    premium: true,
+    formats: ['WAV', 'MP3'],
+    processTime: '~10-20s',
+    maxSize: '5 MB sample',
+    tips: [
+      'Sample sạch (không nhạc) cho output tự nhiên nhất',
+      'Premium vì cần GPU ≥ 8GB VRAM',
+      'Tuyệt đối không clone giọng người khác trái phép'
+    ],
+    relatedIds: ['whisper', 'caption']
   }
 ];
 
@@ -1236,7 +1520,89 @@ export function App() {
   const [optionValues, setOptionValues] = useState<Record<string, string | number>>(() => defaultsForTool('word-to-pdf'));
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const toastIdRef = useRef(0);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notifSeenCount, setNotifSeenCount] = useState(0);
   const [recentEntries, setRecentEntries] = useState<RecentEntry[]>([]);
+  const [headerMenu, setHeaderMenu] = useState<'none' | 'cmd' | 'notif' | 'health' | 'avatar'>('none');
+  const [cmdQuery, setCmdQuery] = useState('');
+  const [cmdIndex, setCmdIndex] = useState(0);
+  const cmdInputRef = useRef<HTMLInputElement | null>(null);
+  // Library filters
+  const [libSearch, setLibSearch] = useState('');
+  const [libView, setLibView] = useState<'grid' | 'list'>('grid');
+  const [libTab, setLibTab] = useState<'recent' | 'shared' | 'presets'>('recent');
+  const [libRange, setLibRange] = useState<'today' | '7d' | '30d' | 'all'>('all');
+  const [libKind, setLibKind] = useState<'all' | 'image' | 'doc' | 'audio'>('all');
+  const [libTools, setLibTools] = useState<Set<string>>(new Set());
+  // AI Lab toolbar / modal
+  const [labSearch, setLabSearch] = useState('');
+  const [labCategory, setLabCategory] = useState<'all' | AILabCategory | 'premium' | 'soon'>('all');
+  const [labSort, setLabSort] = useState<'popular' | 'az' | 'new'>('popular');
+  const [labDetailId, setLabDetailId] = useState<string | null>(null);
+  const [labRecentIds, setLabRecentIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('convert-url:lab-recent-v1');
+      return raw ? (JSON.parse(raw) as string[]).slice(0, 4) : [];
+    } catch { return []; }
+  });
+  // AI Lab workspace
+  const [labView, setLabView] = useState<'grid' | 'workspace'>('grid');
+  const [labWorkspaceCard, setLabWorkspaceCard] = useState<AILabCard | null>(null);
+  const [labWsFile, setLabWsFile] = useState<File | null>(null);
+  const [labWsPreview, setLabWsPreview] = useState<string>('');
+  const [labWsBusy, setLabWsBusy] = useState(false);
+  const [labWsResult, setLabWsResult] = useState<ConvertFile | null>(null);
+  const [labWsError, setLabWsError] = useState('');
+  const [labWsOptions, setLabWsOptions] = useState<Record<string, string | number>>({});
+  const [labWsComparePos, setLabWsComparePos] = useState(50);
+  const [labWsBg, setLabWsBg] = useState<'checker' | 'white' | 'black' | 'emerald' | 'custom'>('checker');
+  const [labWsBgCustom, setLabWsBgCustom] = useState('#0F172A');
+  const [labWsDragging, setLabWsDragging] = useState(false);
+  const [labWsSrcDims, setLabWsSrcDims] = useState<{ w: number; h: number } | null>(null);
+  const [labWsResultDims, setLabWsResultDims] = useState<{ w: number; h: number } | null>(null);
+  const [labWsShowGrid, setLabWsShowGrid] = useState(true);
+  const labWsInputRef = useRef<HTMLInputElement | null>(null);
+  const labWsCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Audio Studio (Tách nhạc & lời)
+  const [labAudioMode, setLabAudioMode] = useState<'lyrics' | 'stems'>('lyrics');
+  const [labAudioUrl, setLabAudioUrl] = useState('');
+  const [labAudioBusy, setLabAudioBusy] = useState(false);
+  const [labAudioResult, setLabAudioResult] = useState<TranscriptResult | null>(null);
+  const [labAudioError, setLabAudioError] = useState('');
+  const [labAudioLang, setLabAudioLang] = useState<string>('auto');
+  const [labAudioUseWhisper, setLabAudioUseWhisper] = useState(true);
+  const [labAudioView, setLabAudioView] = useState<'segments' | 'plain' | 'srt' | 'markdown'>('segments');
+  const [labAudioCopiedField, setLabAudioCopiedField] = useState('');
+  // Stems mode
+  const [labStemsUrl, setLabStemsUrl] = useState('');
+  const [labStemsModel, setLabStemsModel] = useState<'htdemucs' | 'htdemucs_ft' | 'mdx_extra'>('htdemucs');
+  const [labStemsBusy, setLabStemsBusy] = useState(false);
+  const [labStemsError, setLabStemsError] = useState('');
+  const [labStemsResult, setLabStemsResult] = useState<StemsResult | null>(null);
+  const [labStemsPlaying, setLabStemsPlaying] = useState(false);
+  const [labStemsProgress, setLabStemsProgress] = useState(0); // 0..1
+  const [labStemsDuration, setLabStemsDuration] = useState(0);
+  const [labStemsCurrentTime, setLabStemsCurrentTime] = useState(0);
+  const [labStemsVolumes, setLabStemsVolumes] = useState<Record<string, number>>({ vocals: 100, drums: 100, bass: 100, other: 100 });
+  const [labStemsMuted, setLabStemsMuted] = useState<Record<string, boolean>>({ vocals: false, drums: false, bass: false, other: false });
+  const [labStemsSolo, setLabStemsSolo] = useState<string | null>(null);
+  const labStemsAudioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  // Object removal (Inpaint) workspace
+  const [labInpaintMode, setLabInpaintMode] = useState<'smart' | 'subject' | 'manual'>('smart');
+  // Smart object detection (YOLOv8)
+  const [labDetectResult, setLabDetectResult] = useState<DetectObjectsResult | null>(null);
+  const [labRemoveIds, setLabRemoveIds] = useState<Set<number>>(new Set());
+  const [labDetectBusy, setLabDetectBusy] = useState(false);
+  const [labHoverObjId, setLabHoverObjId] = useState<number | null>(null);
+  const [labInpaintBrushSize, setLabInpaintBrushSize] = useState(40);
+  const [labInpaintTool, setLabInpaintTool] = useState<'brush' | 'eraser'>('brush');
+  const [labInpaintHasStrokes, setLabInpaintHasStrokes] = useState(false);
+  const [labInpaintAutoMask, setLabInpaintAutoMask] = useState<string>(''); // dataURL of detected subject overlay
+  const [labInpaintAutoBusy, setLabInpaintAutoBusy] = useState(false);
+  const labInpaintImageRef = useRef<HTMLImageElement | null>(null);
+  const labInpaintMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const labInpaintIsDrawingRef = useRef(false);
+  const labInpaintLastPosRef = useRef<{ x: number; y: number } | null>(null);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraBusy, setCameraBusy] = useState(false);
   const [cameraError, setCameraError] = useState('');
@@ -1270,6 +1636,10 @@ export function App() {
   const pushToast = useCallback((toast: Omit<ToastMessage, 'id'>) => {
     const id = ++toastIdRef.current;
     setToasts((current) => [...current.slice(-3), { ...toast, id }]);
+    setNotifications((current) => {
+      const next: NotificationItem = { id, variant: toast.variant, title: toast.title, detail: toast.detail, at: Date.now() };
+      return [next, ...current].slice(0, NOTIF_LIMIT);
+    });
     const ttl = toast.variant === 'error' ? 7000 : 4500;
     window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== id)), ttl);
   }, []);
@@ -1277,6 +1647,48 @@ export function App() {
   const dismissToast = useCallback((id: number) => {
     setToasts((current) => current.filter((toast) => toast.id !== id));
   }, []);
+
+  function closeHeaderMenu() {
+    setHeaderMenu('none');
+    setCmdQuery('');
+    setCmdIndex(0);
+  }
+
+  function toggleHeaderMenu(menu: 'cmd' | 'notif' | 'health' | 'avatar') {
+    setHeaderMenu((current) => {
+      if (current === menu) {
+        setCmdQuery('');
+        setCmdIndex(0);
+        return 'none';
+      }
+      if (menu === 'notif') {
+        setNotifSeenCount(notifications.length);
+      }
+      return menu;
+    });
+  }
+
+  function clearNotifications() {
+    setNotifications([]);
+    setNotifSeenCount(0);
+  }
+
+  function dismissNotification(id: number) {
+    setNotifications((current) => current.filter((n) => n.id !== id));
+  }
+
+  async function refreshHealth() {
+    setHealthError('');
+    try {
+      const data = await getHealth();
+      setHealth(data);
+      pushToast({ variant: data.ready ? 'success' : 'info', title: 'Đã làm mới trạng thái', detail: data.ready ? 'Tất cả công cụ sẵn sàng.' : data.message });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Không kiểm tra được';
+      setHealthError(msg);
+      pushToast({ variant: 'error', title: 'Refresh health thất bại', detail: msg });
+    }
+  }
 
   const loadFeed = useCallback(async (silent = false) => {
     try {
@@ -1389,6 +1801,112 @@ export function App() {
     setOptionValues(defaultsForTool(selectedTool));
   }, [selectedTool]);
 
+  // Global keyboard: Ctrl/Cmd+K opens palette, Esc closes any open header menu
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const isCmdK = (e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey);
+      if (isCmdK) {
+        e.preventDefault();
+        setHeaderMenu((prev) => (prev === 'cmd' ? 'none' : 'cmd'));
+        setCmdQuery('');
+        setCmdIndex(0);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setHeaderMenu('none');
+        setCmdQuery('');
+        setLabDetailId(null);
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // Auto-focus search input when command palette opens
+  useEffect(() => {
+    if (headerMenu === 'cmd') {
+      window.setTimeout(() => cmdInputRef.current?.focus(), 30);
+    }
+  }, [headerMenu]);
+
+  // Close header menus when clicking outside the topbar
+  useEffect(() => {
+    if (headerMenu === 'none') return;
+    function onClick(e: MouseEvent) {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target.closest('.forge-topbar') || target.closest('.forge-header-menu')) return;
+      setHeaderMenu('none');
+    }
+    window.addEventListener('mousedown', onClick);
+    return () => window.removeEventListener('mousedown', onClick);
+  }, [headerMenu]);
+
+  // Read source image dimensions when preview URL changes
+  useEffect(() => {
+    if (!labWsPreview) { setLabWsSrcDims(null); return; }
+    const img = new window.Image();
+    img.onload = () => setLabWsSrcDims({ w: img.naturalWidth, h: img.naturalHeight });
+    img.src = labWsPreview;
+  }, [labWsPreview]);
+
+  // Read result image dimensions when result changes
+  useEffect(() => {
+    if (!labWsResult) { setLabWsResultDims(null); return; }
+    const img = new window.Image();
+    img.onload = () => setLabWsResultDims({ w: img.naturalWidth, h: img.naturalHeight });
+    img.src = labWsResult.downloadUrl;
+  }, [labWsResult]);
+
+  // Stems mode: time tracking + cleanup on unmount
+  useEffect(() => {
+    if (!labStemsResult || !labStemsPlaying) return;
+    let raf: number;
+    function tick() {
+      const master = labStemsAudioRefs.current[labStemsResult!.stems[0]?.name];
+      if (master) {
+        setLabStemsCurrentTime(master.currentTime);
+        if (labStemsDuration > 0) setLabStemsProgress(master.currentTime / labStemsDuration);
+        if (master.ended || master.currentTime >= labStemsDuration - 0.1) {
+          Object.values(labStemsAudioRefs.current).forEach((a) => a?.pause());
+          setLabStemsPlaying(false);
+          return;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    }
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [labStemsResult, labStemsPlaying, labStemsDuration]);
+
+  useEffect(() => {
+    // Cleanup when leaving lab tab or workspace
+    if (activeTool !== 'lab' || labView !== 'workspace') {
+      Object.values(labStemsAudioRefs.current).forEach((a) => a?.pause());
+      setLabStemsPlaying(false);
+    }
+  }, [activeTool, labView]);
+
+  // Keyboard: workspace Enter to process, R to reset
+  useEffect(() => {
+    if (labView !== 'workspace') return;
+    function onKey(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT');
+      if (isTyping) return;
+      if (e.key === 'Enter' && !labWsBusy && labWsFile && labWorkspaceCard?.available) {
+        e.preventDefault();
+        runLabWorkspace();
+      } else if ((e.key === 'r' || e.key === 'R') && labWsResult) {
+        e.preventDefault();
+        resetLabWorkspace();
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labView, labWsBusy, labWsFile, labWsResult, labWorkspaceCard]);
+
   function setOptionValue(key: string, value: string | number) {
     setOptionValues((current) => ({ ...current, [key]: value }));
   }
@@ -1473,6 +1991,581 @@ export function App() {
       saveRecent(next);
       return next;
     });
+  }
+
+  function pushLabRecent(id: string) {
+    setLabRecentIds((current) => {
+      const next = [id, ...current.filter((x) => x !== id)].slice(0, 4);
+      try { localStorage.setItem('convert-url:lab-recent-v1', JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+
+  function openLabCard(card: AILabCard) {
+    pushLabRecent(card.id);
+    resetLabWorkspace();
+    // Reset audio workspace state for whisper
+    if (card.id === 'whisper') {
+      setLabAudioMode('lyrics');
+      setLabAudioUrl('');
+      setLabAudioResult(null);
+      setLabAudioError('');
+      setLabAudioView('segments');
+    }
+    // Reset inpaint state. Default to Smart (YOLO) detect — keep main, remove secondary.
+    if (card.id === 'remove-object') {
+      setLabInpaintMode('smart');
+      setLabInpaintAutoMask('');
+      setLabInpaintHasStrokes(false);
+      setLabInpaintTool('brush');
+      setLabDetectResult(null);
+      setLabRemoveIds(new Set());
+      setLabHoverObjId(null);
+    }
+    setLabWorkspaceCard(card);
+    if (card.action && card.id !== 'whisper') {
+      setLabWsOptions(defaultsForTool(card.action.tool));
+    } else {
+      setLabWsOptions({});
+    }
+    setLabView('workspace');
+  }
+
+  async function runAudioWorkspace() {
+    if (!labAudioUrl.trim()) {
+      setLabAudioError('Cần URL video / audio để trích lời');
+      return;
+    }
+    setLabAudioBusy(true);
+    setLabAudioError('');
+    setLabAudioResult(null);
+    try {
+      const languages = labAudioLang === 'auto' ? undefined : [labAudioLang];
+      const result = await fetchTranscript({
+        url: labAudioUrl.trim(),
+        languages,
+        useWhisper: labAudioUseWhisper
+      });
+      setLabAudioResult(result);
+      pushToast({ variant: 'success', title: 'Trích lời thành công', detail: `${result.segments.length} dòng · ${result.languageLabel}` });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không trích được';
+      setLabAudioError(msg);
+      pushToast({ variant: 'error', title: 'Trích lời thất bại', detail: msg });
+    } finally {
+      setLabAudioBusy(false);
+    }
+  }
+
+  async function copyAudioField(text: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setLabAudioCopiedField(key);
+      window.setTimeout(() => setLabAudioCopiedField((c) => (c === key ? '' : c)), 1500);
+    } catch {
+      pushToast({ variant: 'error', title: 'Copy thất bại' });
+    }
+  }
+
+  // ============ Stems mode functions ============
+  async function runStemsSeparation() {
+    if (!labStemsUrl.trim()) {
+      setLabStemsError('Cần URL audio để tách stems');
+      return;
+    }
+    setLabStemsBusy(true);
+    setLabStemsError('');
+    setLabStemsResult(null);
+    stopAllStems();
+    try {
+      const result = await separateStems({ url: labStemsUrl.trim(), model: labStemsModel });
+      setLabStemsResult(result);
+      setLabStemsDuration(result.duration);
+      setLabStemsVolumes({ vocals: 100, drums: 100, bass: 100, other: 100 });
+      setLabStemsMuted({ vocals: false, drums: false, bass: false, other: false });
+      setLabStemsSolo(null);
+      pushToast({ variant: 'success', title: 'Tách stems thành công', detail: `${result.stems.length} stems · ${result.durationLabel}` });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không tách được';
+      setLabStemsError(msg);
+      pushToast({ variant: 'error', title: 'Tách stems thất bại', detail: msg.length > 80 ? msg.slice(0, 80) + '…' : msg });
+    } finally {
+      setLabStemsBusy(false);
+    }
+  }
+
+  function getStemEffectiveVolume(stemName: string): number {
+    if (labStemsMuted[stemName]) return 0;
+    if (labStemsSolo && labStemsSolo !== stemName) return 0;
+    return labStemsVolumes[stemName] / 100;
+  }
+
+  function applyStemsVolumes() {
+    Object.entries(labStemsAudioRefs.current).forEach(([name, audio]) => {
+      if (audio) audio.volume = getStemEffectiveVolume(name);
+    });
+  }
+
+  function toggleStemsPlay() {
+    if (!labStemsResult) return;
+    const refs = labStemsAudioRefs.current;
+    if (labStemsPlaying) {
+      Object.values(refs).forEach((a) => a?.pause());
+      setLabStemsPlaying(false);
+    } else {
+      // Sync all to same currentTime
+      const t = labStemsCurrentTime;
+      Object.values(refs).forEach((a) => {
+        if (a) {
+          a.currentTime = t;
+          a.volume = getStemEffectiveVolume(Object.keys(refs).find((k) => refs[k] === a) || '');
+        }
+      });
+      Promise.all(Object.values(refs).map((a) => a?.play().catch(() => undefined))).then(() => {
+        setLabStemsPlaying(true);
+      });
+    }
+  }
+
+  function stopAllStems() {
+    Object.values(labStemsAudioRefs.current).forEach((a) => {
+      if (a) {
+        a.pause();
+        a.currentTime = 0;
+      }
+    });
+    setLabStemsPlaying(false);
+    setLabStemsCurrentTime(0);
+    setLabStemsProgress(0);
+  }
+
+  function seekStems(seconds: number) {
+    Object.values(labStemsAudioRefs.current).forEach((a) => {
+      if (a) a.currentTime = seconds;
+    });
+    setLabStemsCurrentTime(seconds);
+    if (labStemsDuration > 0) setLabStemsProgress(seconds / labStemsDuration);
+  }
+
+  function setStemVolume(name: string, value: number) {
+    setLabStemsVolumes((prev) => ({ ...prev, [name]: value }));
+    const audio = labStemsAudioRefs.current[name];
+    if (audio) audio.volume = labStemsMuted[name] ? 0 : (labStemsSolo && labStemsSolo !== name ? 0 : value / 100);
+  }
+
+  function toggleStemMute(name: string) {
+    setLabStemsMuted((prev) => {
+      const next = { ...prev, [name]: !prev[name] };
+      const audio = labStemsAudioRefs.current[name];
+      if (audio) audio.volume = next[name] ? 0 : (labStemsSolo && labStemsSolo !== name ? 0 : labStemsVolumes[name] / 100);
+      return next;
+    });
+  }
+
+  function toggleStemSolo(name: string) {
+    setLabStemsSolo((prev) => {
+      const next = prev === name ? null : name;
+      // Update all audio volumes immediately
+      Object.entries(labStemsAudioRefs.current).forEach(([n, audio]) => {
+        if (audio) {
+          if (labStemsMuted[n]) {
+            audio.volume = 0;
+          } else if (next && next !== n) {
+            audio.volume = 0;
+          } else {
+            audio.volume = labStemsVolumes[n] / 100;
+          }
+        }
+      });
+      return next;
+    });
+  }
+
+  // ============ Inpaint (Remove Object) helpers ============
+  function clearInpaintMask() {
+    const canvas = labInpaintMaskCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setLabInpaintHasStrokes(false);
+    setLabInpaintAutoMask('');
+  }
+
+  function initInpaintCanvas() {
+    const canvas = labInpaintMaskCanvasRef.current;
+    const img = labInpaintImageRef.current;
+    if (!canvas || !img) return;
+    // Match canvas internal resolution to image natural size
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setLabInpaintHasStrokes(false);
+  }
+
+  function inpaintCanvasCoords(e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>): { x: number; y: number } | null {
+    const canvas = labInpaintMaskCanvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const point = 'touches' in e ? e.touches[0] || e.changedTouches[0] : e;
+    if (!point) return null;
+    const x = ((point.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((point.clientY - rect.top) / rect.height) * canvas.height;
+    return { x, y };
+  }
+
+  function inpaintDrawAt(x: number, y: number) {
+    const canvas = labInpaintMaskCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    // Brush size scales with canvas resolution
+    const scaledBrush = (labInpaintBrushSize / 100) * Math.min(canvas.width, canvas.height) * 0.15;
+    const r = Math.max(4, scaledBrush);
+    if (labInpaintTool === 'eraser') {
+      ctx.globalCompositeOperation = 'destination-out';
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = 'rgba(244, 63, 94, 0.55)'; // semi-transparent rose
+    }
+    const last = labInpaintLastPosRef.current;
+    if (last) {
+      // Draw line between last and current for smooth strokes
+      ctx.beginPath();
+      ctx.lineWidth = r * 2;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = labInpaintTool === 'eraser' ? 'rgba(0,0,0,1)' : 'rgba(244, 63, 94, 0.55)';
+      ctx.moveTo(last.x, last.y);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    labInpaintLastPosRef.current = { x, y };
+    if (labInpaintTool === 'brush' && !labInpaintHasStrokes) setLabInpaintHasStrokes(true);
+  }
+
+  function exportInpaintMaskDataUrl(): string | null {
+    // Build binary B/W mask from current strokes (white = inpaint)
+    const canvas = labInpaintMaskCanvasRef.current;
+    if (!canvas) return null;
+    const src = canvas.getContext('2d');
+    if (!src) return null;
+    const out = document.createElement('canvas');
+    out.width = canvas.width;
+    out.height = canvas.height;
+    const outCtx = out.getContext('2d');
+    if (!outCtx) return null;
+    outCtx.fillStyle = '#000';
+    outCtx.fillRect(0, 0, out.width, out.height);
+    const imgData = src.getImageData(0, 0, canvas.width, canvas.height);
+    const outData = outCtx.getImageData(0, 0, out.width, out.height);
+    for (let i = 0; i < imgData.data.length; i += 4) {
+      // Any alpha > 0 → white in output mask
+      if (imgData.data[i + 3] > 5) {
+        outData.data[i] = 255;
+        outData.data[i + 1] = 255;
+        outData.data[i + 2] = 255;
+        outData.data[i + 3] = 255;
+      }
+    }
+    outCtx.putImageData(outData, 0, 0);
+    return out.toDataURL('image/png');
+  }
+
+  // OLD: rembg "remove main subject" (kept for 'subject' mode)
+  async function detectInpaintSubject() {
+    if (!labWsFile) return;
+    setLabInpaintAutoBusy(true);
+    try {
+      const result = await convertFile('remove-background', labWsFile, { model: 'u2net' });
+      if (result.files[0]) {
+        setLabInpaintAutoMask(result.files[0].downloadUrl);
+        pushToast({ variant: 'success', title: 'Đã phát hiện chủ thể', detail: 'Kiểm tra preview rồi bấm Xoá' });
+      }
+    } catch (err) {
+      pushToast({ variant: 'error', title: 'Phát hiện thất bại', detail: err instanceof Error ? err.message.slice(0, 80) : '' });
+    } finally {
+      setLabInpaintAutoBusy(false);
+    }
+  }
+
+  // NEW: YOLOv8 smart detect — find all objects, keep main, mark secondary for removal
+  async function detectInpaintObjects() {
+    if (!labWsFile) return;
+    setLabDetectBusy(true);
+    setLabWsError('');
+    try {
+      const result = await detectObjects(labWsFile, 'yolov8m-seg.pt');
+      setLabDetectResult(result);
+      // Default: select all secondary objects for removal
+      setLabRemoveIds(new Set(result.objects.filter((o) => !o.isMain).map((o) => o.id)));
+      if (result.objects.length === 0) {
+        pushToast({ variant: 'info', title: 'Không phát hiện vật thể', detail: 'Thử Manual brush để vẽ tay vùng cần xoá.' });
+      } else {
+        pushToast({ variant: 'success', title: `Phát hiện ${result.objects.length} vật thể`, detail: `${result.mainCount} chủ thể chính · ${result.secondaryCount} vật thể phụ` });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Phát hiện thất bại';
+      setLabWsError(msg);
+      pushToast({ variant: 'error', title: 'Phát hiện vật thể thất bại', detail: msg.slice(0, 80) });
+    } finally {
+      setLabDetectBusy(false);
+    }
+  }
+
+  function toggleRemoveObject(id: number) {
+    setLabRemoveIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function loadImageEl(src: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new window.Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  // Composite selected object masks into a single B/W mask dataURL
+  async function buildObjectMaskDataUrl(): Promise<string | null> {
+    if (!labDetectResult) return null;
+    const selected = labDetectResult.objects.filter((o) => labRemoveIds.has(o.id));
+    if (selected.length === 0) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = labDetectResult.width;
+    canvas.height = labDetectResult.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = 'lighter'; // white OR white stays white
+    for (const obj of selected) {
+      try {
+        const img = await loadImageEl(obj.maskUrl);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      } catch { /* skip failed mask */ }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    return canvas.toDataURL('image/png');
+  }
+
+  async function runInpaintWorkspace() {
+    if (!labWsFile || !labWorkspaceCard) return;
+    setLabWsBusy(true);
+    setLabWsError('');
+    try {
+      const options: Record<string, string | number> = {
+        mode: 'manual', // backend always uses provided mask
+        method: String(labWsOptions.method ?? 'auto'),
+        dilate: Number(labWsOptions.dilate ?? 12),
+        feather: Number(labWsOptions.feather ?? 3),
+        ldmSteps: Number(labWsOptions.ldmSteps ?? 35),
+        removeShadow: String(labWsOptions.removeShadow ?? 'true'),
+        removeReflection: String(labWsOptions.removeReflection ?? 'true'),
+        premium: String(labWsOptions.premium ?? 'true')
+      };
+
+      if (labInpaintMode === 'smart') {
+        const maskDataUrl = await buildObjectMaskDataUrl();
+        if (!maskDataUrl) throw new Error('Chưa chọn vật thể nào để xoá. Tích vào vật thể phụ trong danh sách.');
+        options.maskDataUrl = maskDataUrl;
+      } else if (labInpaintMode === 'subject') {
+        options.mode = 'auto'; // backend re-runs rembg to build mask
+      } else {
+        // manual brush
+        const dataUrl = exportInpaintMaskDataUrl();
+        if (!dataUrl) throw new Error('Không export được mask.');
+        if (!labInpaintHasStrokes) throw new Error('Bạn chưa vẽ vùng nào để xoá. Dùng brush tool để bôi lên vật thể.');
+        options.maskDataUrl = dataUrl;
+      }
+
+      const result = await convertFile('remove-object', labWsFile, options);
+      if (!result.files.length) throw new Error('Không có file kết quả trả về');
+      setLabWsResult(result.files[0]);
+      setLabWsComparePos(50);
+      pushToast({ variant: 'success', title: 'Đã xoá vật thể', detail: 'Kéo slider để so sánh trước/sau' });
+      persistRecent(result, labWorkspaceCard.title);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Có lỗi xảy ra';
+      setLabWsError(msg);
+      pushToast({ variant: 'error', title: 'Xoá vật thể thất bại', detail: msg.length > 80 ? msg.slice(0, 80) + '…' : msg });
+    } finally {
+      setLabWsBusy(false);
+    }
+  }
+
+  function downloadAudioFile(filename: string, content: string, mime = 'text/plain;charset=utf-8') {
+    const blob = new Blob([content], { type: mime });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+  }
+
+  function resetLabWorkspace() {
+    setLabWsFile(null);
+    if (labWsPreview) URL.revokeObjectURL(labWsPreview);
+    setLabWsPreview('');
+    setLabWsResult(null);
+    setLabWsError('');
+    setLabWsBusy(false);
+    setLabWsComparePos(50);
+    setLabWsBg('checker');
+  }
+
+  function backToLabGrid() {
+    if (labWsPreview) URL.revokeObjectURL(labWsPreview);
+    setLabView('grid');
+    setLabWorkspaceCard(null);
+    setLabWsFile(null);
+    setLabWsPreview('');
+    setLabWsResult(null);
+    setLabWsError('');
+    setLabWsOptions({});
+  }
+
+  function handleLabWsFile(file: File) {
+    if (!file.type.startsWith('image/')) {
+      pushToast({ variant: 'error', title: 'File không phải ảnh', detail: file.type });
+      return;
+    }
+    if (labWsPreview) URL.revokeObjectURL(labWsPreview);
+    const url = URL.createObjectURL(file);
+    setLabWsFile(file);
+    setLabWsPreview(url);
+    setLabWsResult(null);
+    setLabWsError('');
+  }
+
+  function setLabWsOption(key: string, value: string | number) {
+    setLabWsOptions((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function megapixels(w: number, h: number): string {
+    const mp = (w * h) / 1_000_000;
+    if (mp < 1) return `${Math.round(mp * 1000)} KP`;
+    return `${mp.toFixed(1)} MP`;
+  }
+
+  function estimateUpscaledBytes(srcBytes: number, scale: number): number {
+    // Heuristic: file size scales roughly with pixel count (~scale²) but PNG/WebP compression varies
+    return Math.round(srcBytes * scale * scale * 0.85);
+  }
+
+  function loadLabSample(toolId: FileToolId) {
+    // Generate a tiny 600×400 sample image client-side via canvas
+    const canvas = document.createElement('canvas');
+    canvas.width = 600;
+    canvas.height = 400;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    // Background gradient
+    const grad = ctx.createLinearGradient(0, 0, 600, 400);
+    if (toolId === 'remove-background' || toolId === 'chroma-key') {
+      grad.addColorStop(0, '#0F4D2A');
+      grad.addColorStop(1, '#1A8348');
+    } else if (toolId === 'upscale-image') {
+      grad.addColorStop(0, '#FFA94D');
+      grad.addColorStop(0.5, '#FF6B6B');
+      grad.addColorStop(1, '#845EF7');
+    } else if (toolId === 'scan-document') {
+      grad.addColorStop(0, '#FEF3C7');
+      grad.addColorStop(1, '#FCD34D');
+    } else {
+      grad.addColorStop(0, '#A7F3D0');
+      grad.addColorStop(1, '#047857');
+    }
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 600, 400);
+    // Subject (silhouette / shapes)
+    if (toolId === 'remove-background' || toolId === 'chroma-key') {
+      // Portrait silhouette
+      ctx.fillStyle = '#fef3c7';
+      ctx.beginPath(); ctx.arc(300, 160, 70, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#0F172A';
+      ctx.fillRect(190, 230, 220, 200);
+    } else if (toolId === 'scan-document') {
+      // Document with text lines
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(80, 60, 440, 280);
+      ctx.fillStyle = '#64748B';
+      for (let i = 0; i < 12; i++) {
+        ctx.fillRect(110, 90 + i * 20, 380 - (i % 3) * 60, 4);
+      }
+    } else if (toolId === 'crop-image') {
+      // Landscape
+      ctx.fillStyle = '#FBBF24';
+      ctx.beginPath(); ctx.arc(460, 110, 32, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#475569';
+      ctx.beginPath(); ctx.moveTo(60, 400); ctx.lineTo(200, 200); ctx.lineTo(340, 400); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#64748B';
+      ctx.beginPath(); ctx.moveTo(280, 400); ctx.lineTo(420, 180); ctx.lineTo(560, 400); ctx.closePath(); ctx.fill();
+    } else {
+      // Default abstract shapes
+      ctx.fillStyle = 'rgba(255, 255, 255, .35)';
+      ctx.beginPath(); ctx.arc(200, 150, 80, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(420, 260, 100, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 28px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Forge Sample', 300, 210);
+    }
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const file = new File([blob], `sample-${toolId}.png`, { type: 'image/png' });
+      handleLabWsFile(file);
+    }, 'image/png');
+  }
+
+  async function pickColorWithEyeDropper() {
+    // EyeDropper API — Chrome/Edge 95+
+    const w = window as typeof window & { EyeDropper?: new () => { open: () => Promise<{ sRGBHex: string }> } };
+    if (!w.EyeDropper) {
+      pushToast({ variant: 'info', title: 'EyeDropper không hỗ trợ', detail: 'Trình duyệt này không có color picker hệ thống. Dùng input HEX thay thế.' });
+      return;
+    }
+    try {
+      const result = await new w.EyeDropper().open();
+      setLabWsOption('color', result.sRGBHex);
+      setLabWsOption('target', 'custom');
+      pushToast({ variant: 'success', title: 'Đã chọn màu', detail: result.sRGBHex });
+    } catch {
+      // user cancelled
+    }
+  }
+
+  async function runLabWorkspace() {
+    if (!labWorkspaceCard || !labWsFile || !labWorkspaceCard.action) return;
+    setLabWsBusy(true);
+    setLabWsError('');
+    try {
+      const result = await convertFile(labWorkspaceCard.action.tool, labWsFile, labWsOptions);
+      if (!result.files.length) throw new Error('Không có file kết quả trả về');
+      setLabWsResult(result.files[0]);
+      setLabWsComparePos(50);
+      pushToast({ variant: 'success', title: 'Hoàn tất!', detail: labWorkspaceCard.title });
+      // Persist to library
+      persistRecent(result, labWorkspaceCard.title);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Có lỗi xảy ra';
+      setLabWsError(msg);
+      pushToast({ variant: 'error', title: 'Xử lý thất bại', detail: msg });
+    } finally {
+      setLabWsBusy(false);
+    }
   }
 
   function canUseTool(tool: FileTool) {
@@ -1914,6 +3007,95 @@ export function App() {
     ? `Node ${health?.nodeVersion}. LibreOffice: ${health?.libreOfficeReady ? '✓' : '✗'} · pdf2docx: ${health?.pdf2docxReady ? '✓' : '✗'} · rembg: ${health?.rembgReady ? '✓' : '✗'}.`
     : healthError || health?.message || 'Đang đọc trạng thái công cụ...';
 
+  // ====== Command palette items ======
+  type CmdItem = {
+    id: string;
+    title: string;
+    subtitle?: string;
+    section: 'Trang' | 'Công cụ file' | 'Workflow' | 'Hành động';
+    icon: 'media' | 'files' | 'transcript' | 'lab' | 'workflows' | 'library' | 'wand' | 'workflow' | 'refresh' | 'github' | 'help';
+    keywords: string;
+    run: () => void;
+  };
+
+  const cmdAllItems: CmdItem[] = useMemo(() => {
+    const items: CmdItem[] = [
+      { id: 'go:media', title: 'Media URL', subtitle: 'Tải video / audio từ link', section: 'Trang', icon: 'media', keywords: 'media url youtube tiktok video mp4 mp3', run: () => { setActiveTool('media'); closeHeaderMenu(); } },
+      { id: 'go:files', title: 'File Tools', subtitle: '28 công cụ chuyển đổi file', section: 'Trang', icon: 'files', keywords: 'file convert excel json xml pdf image', run: () => { setActiveTool('files'); closeHeaderMenu(); } },
+      { id: 'go:transcript', title: 'Transcript', subtitle: 'Trích script video bằng AI', section: 'Trang', icon: 'transcript', keywords: 'transcript script subtitle whisper youtube srt', run: () => { setActiveTool('transcript'); closeHeaderMenu(); } },
+      { id: 'go:lab', title: 'AI Lab', subtitle: 'Bộ sưu tập AI', section: 'Trang', icon: 'lab', keywords: 'ai lab xoá nền remove background chroma upscale', run: () => { setActiveTool('lab'); closeHeaderMenu(); } },
+      { id: 'go:workflows', title: 'Workflows', subtitle: '6 template 1-click', section: 'Trang', icon: 'workflows', keywords: 'workflow template quy trình youtube blog mp3 podcast', run: () => { setActiveTool('workflows'); closeHeaderMenu(); } },
+      { id: 'go:library', title: 'Library', subtitle: `${recentEntries.length} job đã lưu`, section: 'Trang', icon: 'library', keywords: 'library history lịch sử recent', run: () => { setActiveTool('library'); closeHeaderMenu(); } },
+    ];
+    fileTools.forEach((tool) => {
+      const groupId = (toolGroups.find((g) => g.tools.some((t) => t.id === tool.id))?.id ?? 'documents') as FileGroupId;
+      items.push({
+        id: `tool:${tool.id}`,
+        title: tool.title,
+        subtitle: tool.description,
+        section: 'Công cụ file',
+        icon: 'wand',
+        keywords: `${tool.title} ${tool.id} ${tool.badge} ${tool.description}`.toLowerCase(),
+        run: () => { openFileTool(tool.id, groupId); closeHeaderMenu(); }
+      });
+    });
+    workflowTemplates.forEach((tpl) => {
+      items.push({
+        id: `wf:${tpl.id}`,
+        title: tpl.title,
+        subtitle: tpl.subtitle,
+        section: 'Workflow',
+        icon: 'workflow',
+        keywords: `${tpl.title} ${tpl.subtitle} ${tpl.id}`.toLowerCase(),
+        run: () => { applyWorkflow(tpl); closeHeaderMenu(); }
+      });
+    });
+    items.push(
+      { id: 'act:refresh-health', title: 'Refresh trạng thái backend', subtitle: 'Kiểm tra ffmpeg / yt-dlp / LibreOffice...', section: 'Hành động', icon: 'refresh', keywords: 'refresh health backend status', run: () => { refreshHealth(); closeHeaderMenu(); } },
+      { id: 'act:clear-recent', title: 'Xoá toàn bộ lịch sử Library', subtitle: 'Xoá recentEntries trong trình duyệt', section: 'Hành động', icon: 'refresh', keywords: 'clear history library', run: () => { clearRecent(); pushToast({ variant: 'info', title: 'Đã xoá lịch sử' }); closeHeaderMenu(); } },
+      { id: 'act:github', title: 'Mở repo GitHub', subtitle: 'github.com/TranVinhTanDat/Convert_URL', section: 'Hành động', icon: 'github', keywords: 'github source code repo', run: () => { window.open('https://github.com/TranVinhTanDat/Convert_URL', '_blank', 'noreferrer'); closeHeaderMenu(); } }
+    );
+    return items;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recentEntries.length]);
+
+  const cmdFilteredItems = useMemo(() => {
+    const q = cmdQuery.trim().toLowerCase();
+    if (!q) return cmdAllItems;
+    return cmdAllItems.filter((it) =>
+      it.title.toLowerCase().includes(q) ||
+      (it.subtitle ?? '').toLowerCase().includes(q) ||
+      it.keywords.includes(q)
+    );
+  }, [cmdQuery, cmdAllItems]);
+
+  const cmdGroupedItems = useMemo(() => {
+    const groups: Record<string, CmdItem[]> = {};
+    cmdFilteredItems.slice(0, 20).forEach((it) => {
+      (groups[it.section] ??= []).push(it);
+    });
+    return Object.entries(groups);
+  }, [cmdFilteredItems]);
+
+  const unseenNotifs = Math.max(0, notifications.length - notifSeenCount);
+
+  const healthChecks: Array<{ key: string; label: string; ok: boolean; hint: string }> = [
+    { key: 'ffmpeg', label: 'FFmpeg', ok: !!health?.ffmpegReady, hint: 'Convert video / audio' },
+    { key: 'ffprobe', label: 'FFprobe', ok: !!health?.ffprobeReady, hint: 'Đọc metadata media' },
+    { key: 'ytdlp', label: 'yt-dlp', ok: !!health?.ytdlpReady, hint: 'Tải video URL + sub' },
+    { key: 'libreoffice', label: 'LibreOffice', ok: !!health?.libreOfficeReady, hint: 'Word → PDF' },
+    { key: 'pdf2docx', label: 'pdf2docx', ok: !!health?.pdf2docxReady, hint: 'PDF → Word (giữ table/format)' },
+    { key: 'ocrmypdf', label: 'OCRmyPDF', ok: !!health?.ocrmypdfReady, hint: 'OCR PDF scan + tables' },
+    { key: 'rembg', label: 'rembg (AI)', ok: !!health?.rembgReady, hint: 'Xoá nền ảnh' },
+    { key: 'whisper', label: 'Whisper', ok: !!health?.whisperReady, hint: 'Transcript AI local' },
+    { key: 'demucs', label: 'Demucs', ok: !!health?.demucsReady, hint: 'Tách stems audio AI' },
+    { key: 'opencv', label: 'OpenCV', ok: !!health?.opencvReady, hint: 'Inpaint cv2 (xoá vật thể)' },
+    { key: 'lama', label: 'LaMa AI', ok: !!health?.lamaReady, hint: 'Deep learning inpaint (best)' },
+    { key: 'openai', label: 'OpenAI', ok: !!health?.openAIReady, hint: 'Fallback transcript cloud' }
+  ];
+
+  const okCount = healthChecks.filter((c) => c.ok).length;
+
   return (
     <div className="forge-shell">
       {/* ============ Sidebar ============ */}
@@ -1983,22 +3165,264 @@ export function App() {
             <span>{activeTool === 'media' ? 'Media URL' : activeTool === 'files' ? 'File Tools' : activeTool === 'transcript' ? 'Transcript' : activeTool === 'lab' ? 'AI Lab' : activeTool === 'workflows' ? 'Workflows' : activeTool === 'library' ? 'Library' : 'Dashboard'}</span>
           </div>
 
-          <button type="button" className="forge-cmdk">
+          <button type="button" className="forge-cmdk" onClick={() => toggleHeaderMenu('cmd')}>
             <Search size={14} />
             <span>Search or jump to…</span>
-            <span className="forge-cmdk-kbd">⌘K</span>
+            <span className="forge-cmdk-kbd">Ctrl+K</span>
           </button>
 
           <div className="forge-topbar-actions">
-            <button type="button" className="forge-icon-btn" title="Notifications" aria-label="Notifications">
-              <AlertTriangle size={17} />
-              <span className="forge-notification-dot" />
+            <button
+              type="button"
+              className={`forge-icon-btn ${headerMenu === 'notif' ? 'is-open' : ''}`}
+              title="Notifications"
+              aria-label="Notifications"
+              onClick={() => toggleHeaderMenu('notif')}
+            >
+              <Bell size={17} />
+              {unseenNotifs > 0 ? <span className="forge-notification-dot">{unseenNotifs > 9 ? '9+' : unseenNotifs}</span> : null}
             </button>
-            <button type="button" className="forge-icon-btn" title={ready ? 'Hệ thống sẵn sàng' : 'Cần kiểm tra'} aria-label="Health">
+            <button
+              type="button"
+              className={`forge-icon-btn ${headerMenu === 'health' ? 'is-open' : ''}`}
+              title={ready ? 'Hệ thống sẵn sàng' : 'Cần kiểm tra'}
+              aria-label="Health"
+              onClick={() => toggleHeaderMenu('health')}
+            >
               <CheckCircle2 size={17} style={{ color: ready ? 'var(--forge-success)' : 'var(--forge-warning)' }} />
             </button>
-            <div className="forge-avatar" title="Đạt">Đ</div>
+            <button
+              type="button"
+              className={`forge-avatar ${headerMenu === 'avatar' ? 'is-open' : ''}`}
+              title="Đạt"
+              onClick={() => toggleHeaderMenu('avatar')}
+            >
+              Đ
+            </button>
           </div>
+
+          {/* ============ Command Palette ============ */}
+          {headerMenu === 'cmd' ? (
+            <>
+              <div className="forge-cmd-backdrop" onClick={closeHeaderMenu} />
+              <div className="forge-cmd-panel forge-header-menu" role="dialog" aria-label="Command palette">
+                <div className="forge-cmd-input-wrap">
+                  <Search size={16} />
+                  <input
+                    ref={cmdInputRef}
+                    type="text"
+                    className="forge-cmd-input"
+                    placeholder="Tìm trang, công cụ, workflow, hành động…"
+                    value={cmdQuery}
+                    onChange={(e) => { setCmdQuery(e.target.value); setCmdIndex(0); }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'ArrowDown') { e.preventDefault(); setCmdIndex((i) => Math.min(i + 1, cmdFilteredItems.length - 1)); }
+                      else if (e.key === 'ArrowUp') { e.preventDefault(); setCmdIndex((i) => Math.max(i - 1, 0)); }
+                      else if (e.key === 'Enter') { e.preventDefault(); cmdFilteredItems[cmdIndex]?.run(); }
+                    }}
+                  />
+                  <kbd className="forge-cmd-kbd-esc">Esc</kbd>
+                </div>
+                <div className="forge-cmd-results">
+                  {cmdFilteredItems.length === 0 ? (
+                    <div className="forge-cmd-empty">
+                      <Search size={28} />
+                      <strong>Không tìm thấy</strong>
+                      <span>Thử từ khoá khác hoặc xoá bộ lọc</span>
+                    </div>
+                  ) : (
+                    cmdGroupedItems.map(([section, items]) => (
+                      <div className="forge-cmd-group" key={section}>
+                        <div className="forge-cmd-group-label">{section}</div>
+                        {items.map((it) => {
+                          const flatIdx = cmdFilteredItems.indexOf(it);
+                          const Icon =
+                            it.icon === 'media' ? Link2 :
+                            it.icon === 'files' ? FileSpreadsheet :
+                            it.icon === 'transcript' ? Mic :
+                            it.icon === 'lab' ? Sparkles :
+                            it.icon === 'workflows' ? Workflow :
+                            it.icon === 'library' ? Archive :
+                            it.icon === 'workflow' ? Workflow :
+                            it.icon === 'refresh' ? RefreshCw :
+                            it.icon === 'github' ? Code2 :
+                            it.icon === 'help' ? HelpCircle :
+                            Wand2;
+                          return (
+                            <button
+                              type="button"
+                              key={it.id}
+                              className={`forge-cmd-item ${flatIdx === cmdIndex ? 'active' : ''}`}
+                              onClick={() => it.run()}
+                              onMouseEnter={() => setCmdIndex(flatIdx)}
+                            >
+                              <span className="forge-cmd-item-icon"><Icon size={15} /></span>
+                              <span className="forge-cmd-item-text">
+                                <strong>{it.title}</strong>
+                                {it.subtitle ? <small>{it.subtitle}</small> : null}
+                              </span>
+                              {flatIdx === cmdIndex ? <CornerDownLeft size={13} className="forge-cmd-item-enter" /> : null}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="forge-cmd-foot">
+                  <span><kbd>↑</kbd><kbd>↓</kbd> chọn</span>
+                  <span><kbd>↵</kbd> mở</span>
+                  <span><kbd>Esc</kbd> đóng</span>
+                  <span className="forge-cmd-foot-count">{cmdFilteredItems.length} kết quả</span>
+                </div>
+              </div>
+            </>
+          ) : null}
+
+          {/* ============ Notifications dropdown ============ */}
+          {headerMenu === 'notif' ? (
+            <div className="forge-header-menu forge-notif-menu" role="dialog" aria-label="Thông báo">
+              <div className="forge-menu-head">
+                <div>
+                  <strong>Thông báo</strong>
+                  <small>{notifications.length} sự kiện gần đây</small>
+                </div>
+                {notifications.length > 0 ? (
+                  <button type="button" className="forge-menu-link" onClick={clearNotifications}>
+                    <Trash2 size={12} /> Xoá tất cả
+                  </button>
+                ) : null}
+              </div>
+              <div className="forge-notif-list">
+                {notifications.length === 0 ? (
+                  <div className="forge-notif-empty">
+                    <Bell size={28} />
+                    <strong>Chưa có thông báo</strong>
+                    <span>Job hoàn tất, lỗi và cảnh báo sẽ hiện ở đây</span>
+                  </div>
+                ) : (
+                  notifications.map((n) => (
+                    <div className={`forge-notif-item variant-${n.variant}`} key={n.id}>
+                      <span className="forge-notif-icon">
+                        {n.variant === 'success' ? <CheckCircle2 size={15} /> :
+                         n.variant === 'error' ? <XCircle size={15} /> :
+                         n.variant === 'warning' ? <AlertTriangle size={15} /> :
+                         <Sparkles size={15} />}
+                      </span>
+                      <div className="forge-notif-body">
+                        <strong>{n.title}</strong>
+                        {n.detail ? <span>{n.detail}</span> : null}
+                        <em>{relativeTime(n.at)}</em>
+                      </div>
+                      <button
+                        type="button"
+                        className="forge-notif-close"
+                        aria-label="Đóng"
+                        onClick={() => dismissNotification(n.id)}
+                      >
+                        <XCircle size={13} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : null}
+
+          {/* ============ Health status dropdown ============ */}
+          {headerMenu === 'health' ? (
+            <div className="forge-header-menu forge-health-menu" role="dialog" aria-label="Trạng thái backend">
+              <div className="forge-menu-head">
+                <div>
+                  <strong>Trạng thái backend</strong>
+                  <small>{ready ? `${okCount}/${healthChecks.length} công cụ sẵn sàng` : 'Cần kiểm tra kết nối'}</small>
+                </div>
+                <button type="button" className="forge-menu-link" onClick={refreshHealth}>
+                  <RefreshCw size={12} /> Refresh
+                </button>
+              </div>
+              <div className="forge-health-summary">
+                <div className={`forge-health-pill ${ready ? 'ok' : 'warn'}`}>
+                  {ready ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+                  <span>{ready ? 'Sẵn sàng' : 'Có cảnh báo'}</span>
+                </div>
+                <small>Node {health?.nodeVersion ?? '—'}</small>
+              </div>
+              <div className="forge-health-list">
+                {healthChecks.map((c) => (
+                  <div className={`forge-health-row ${c.ok ? 'ok' : 'off'}`} key={c.key}>
+                    <span className="forge-health-dot" />
+                    <div className="forge-health-row-body">
+                      <strong>{c.label}</strong>
+                      <small>{c.hint}</small>
+                    </div>
+                    <span className="forge-health-status">{c.ok ? 'OK' : 'Offline'}</span>
+                  </div>
+                ))}
+              </div>
+              {healthError ? (
+                <div className="forge-health-error">
+                  <AlertTriangle size={13} /> {healthError}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {/* ============ Avatar menu ============ */}
+          {headerMenu === 'avatar' ? (
+            <div className="forge-header-menu forge-avatar-menu" role="menu" aria-label="Tài khoản">
+              <div className="forge-avatar-head">
+                <div className="forge-avatar-big">Đ</div>
+                <div>
+                  <strong>Đạt</strong>
+                  <small>Free tier · 247 / 500 conversions</small>
+                </div>
+              </div>
+              <div className="forge-avatar-usage">
+                <div className="forge-avatar-usage-bar"><div style={{ width: '49.4%' }} /></div>
+                <small>49.4% sử dụng tháng này · còn 253 conversions</small>
+              </div>
+              <div className="forge-menu-list">
+                <button type="button" className="forge-menu-item" onClick={() => { setActiveTool('library'); closeHeaderMenu(); }}>
+                  <Archive size={14} /> <span>Lịch sử Library</span>
+                  <em>{recentEntries.length}</em>
+                </button>
+                <button type="button" className="forge-menu-item" onClick={() => { toggleHeaderMenu('cmd'); }}>
+                  <Keyboard size={14} /> <span>Command Palette</span>
+                  <em><kbd>⌘K</kbd></em>
+                </button>
+                <button type="button" className="forge-menu-item" onClick={() => { setActiveTool('workflows'); closeHeaderMenu(); }}>
+                  <Workflow size={14} /> <span>Workflow templates</span>
+                  <em>6</em>
+                </button>
+                <button type="button" className="forge-menu-item" onClick={() => { refreshHealth(); closeHeaderMenu(); }}>
+                  <RefreshCw size={14} /> <span>Refresh trạng thái</span>
+                </button>
+              </div>
+              <div className="forge-menu-list">
+                <a className="forge-menu-item" href="https://github.com/TranVinhTanDat/Convert_URL" target="_blank" rel="noreferrer" onClick={closeHeaderMenu}>
+                  <Code2 size={14} /> <span>Mã nguồn GitHub</span>
+                  <em><ExternalLink size={11} /></em>
+                </a>
+                <a className="forge-menu-item" href="https://github.com/TranVinhTanDat/Convert_URL/issues/new" target="_blank" rel="noreferrer" onClick={closeHeaderMenu}>
+                  <LifeBuoy size={14} /> <span>Báo lỗi / góp ý</span>
+                  <em><ExternalLink size={11} /></em>
+                </a>
+                <a className="forge-menu-item" href="https://github.com/TranVinhTanDat/Convert_URL#readme" target="_blank" rel="noreferrer" onClick={closeHeaderMenu}>
+                  <BookOpen size={14} /> <span>Hướng dẫn sử dụng</span>
+                  <em><ExternalLink size={11} /></em>
+                </a>
+              </div>
+              <div className="forge-menu-list">
+                <button type="button" className="forge-menu-item danger" onClick={() => { clearRecent(); clearNotifications(); pushToast({ variant: 'info', title: 'Đã reset workspace' }); closeHeaderMenu(); }}>
+                  <LogOut size={14} /> <span>Reset workspace</span>
+                </button>
+              </div>
+              <div className="forge-avatar-foot">
+                <Sparkles size={11} /> Forge Studio v3.0 · build {new Date().getFullYear()}
+              </div>
+            </div>
+          ) : null}
         </header>
 
         <div className="forge-canvas">
@@ -2708,121 +4132,2147 @@ export function App() {
             </div>
           ) : null}
         </section>
-      ) : activeTool === 'lab' ? (
-        <section className="forge-lab-section">
-          <div className="forge-media-hero" style={{ marginBottom: 32 }}>
-            <span className="forge-eyebrow"><Sparkles size={12} /> AI Lab</span>
-            <h1 className="forge-h1">
-              Lab AI riêng — <em>thử nghiệm</em> sức mạnh
-            </h1>
-            <p className="forge-subhead">
-              Bộ sưu tập công cụ AI nhỏ gọn nhưng chuyên sâu: xoá nền, chroma key, upscale, scan tài liệu, Whisper transcript. Một số tính năng đang lab thử nghiệm — chờ ra mắt.
-            </p>
-          </div>
+      ) : activeTool === 'lab' && labView === 'workspace' && labWorkspaceCard ? (
+        (() => {
+          const card = labWorkspaceCard;
+          const Icon =
+            card.icon === 'eraser' ? Eraser :
+            card.icon === 'palette' ? Palette :
+            card.icon === 'zap' ? Zap :
+            card.icon === 'scan' ? ScanLine :
+            card.icon === 'languages' ? Languages :
+            card.icon === 'mic' ? Mic :
+            card.icon === 'wand' ? Wand2 :
+            card.icon === 'volume' ? Volume2 :
+            Image;
 
-          {/* Hero highlight strip */}
-          <div className="forge-lab-stats">
-            <div className="forge-lab-stat">
-              <div className="forge-lab-stat-icon emerald"><Sparkles size={18} /></div>
-              <div>
-                <strong>{aiLabCards.filter((c) => c.available).length}</strong>
-                <span>Sẵn sàng dùng</span>
-              </div>
-            </div>
-            <div className="forge-lab-stat">
-              <div className="forge-lab-stat-icon violet"><Wand2 size={18} /></div>
-              <div>
-                <strong>{aiLabCards.filter((c) => !c.available).length}</strong>
-                <span>Đang phát triển</span>
-              </div>
-            </div>
-            <div className="forge-lab-stat">
-              <div className="forge-lab-stat-icon peach"><ShieldCheck size={18} /></div>
-              <div>
-                <strong>100%</strong>
-                <span>Local, không upload</span>
-              </div>
-            </div>
-            <div className="forge-lab-stat">
-              <div className="forge-lab-stat-icon sky"><TrendingUp size={18} /></div>
-              <div>
-                <strong>Free</strong>
-                <span>Không giới hạn</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Cards grid */}
-          <div className="forge-lab-grid">
-            {aiLabCards.map((card) => {
-              const Icon =
-                card.icon === 'eraser' ? Eraser :
-                card.icon === 'palette' ? Palette :
-                card.icon === 'zap' ? Zap :
-                card.icon === 'scan' ? ScanLine :
-                card.icon === 'languages' ? Languages :
-                card.icon === 'mic' ? Mic :
-                card.icon === 'wand' ? Wand2 :
-                card.icon === 'volume' ? Volume2 :
-                Image;
-              const handleClick = () => {
-                if (!card.available) return;
-                if (card.id === 'whisper') {
-                  setActiveTool('transcript');
-                  pushToast({ variant: 'info', title: 'Transcript đã mở', detail: 'Dán link video để bắt đầu' });
-                  return;
-                }
-                if (card.action) {
-                  openFileTool(card.action.tool, card.action.group);
-                  pushToast({ variant: 'success', title: card.title, detail: 'Sẵn sàng nhận file' });
-                }
-              };
-              return (
-                <div
-                  key={card.id}
-                  className={`forge-lab-card accent-${card.accent} ${card.available ? '' : 'is-soon'}`}
-                  role={card.available ? 'button' : undefined}
-                  tabIndex={card.available ? 0 : -1}
-                  onClick={handleClick}
-                  onKeyDown={(e) => { if (card.available && (e.key === 'Enter' || e.key === ' ')) handleClick(); }}
-                >
-                  <div className="forge-lab-card-icon"><Icon size={24} /></div>
-                  <div className="forge-lab-card-body">
-                    <div className="forge-lab-card-tag">{card.tag}</div>
-                    <h3>{card.title}</h3>
-                    <p>{card.description}</p>
+          // Soon / Premium → roadmap page
+          if (!card.available) {
+            return (
+              <section className={`forge-labws forge-labws-soon accent-${card.accent}`}>
+                <button type="button" className="forge-labws-back" onClick={backToLabGrid}>
+                  <ArrowRight size={14} style={{ transform: 'rotate(180deg)' }} /> Quay lại AI Lab
+                </button>
+                <div className="forge-labws-soon-hero">
+                  <div className="forge-labws-soon-icon"><Icon size={36} /></div>
+                  <div className="forge-labws-soon-pill">
+                    {card.premium ? (<><Sparkles size={11} /> PREMIUM · {card.comingSoon ?? 'Sắp ra'}</>) : (<><Clock size={11} /> {card.comingSoon ?? 'Sắp ra mắt'}</>)}
                   </div>
-                  <div className="forge-lab-card-foot">
-                    {card.available ? (
-                      <>
-                        <span className="forge-lab-card-link">
-                          {card.action?.label ?? 'Mở công cụ'} <ArrowRight size={14} />
-                        </span>
-                      </>
-                    ) : (
-                      <span className="forge-lab-card-soon">
-                        <Clock size={13} /> {card.comingSoon ?? 'Sắp ra'}
-                      </span>
-                    )}
+                  <h1>{card.title}</h1>
+                  <p>{card.longDescription ?? card.description}</p>
+                </div>
+
+                <div className="forge-labws-soon-grid">
+                  <div className="forge-labws-soon-block">
+                    <div className="forge-labws-soon-block-title"><Sparkles size={13} /> Tính năng dự kiến</div>
+                    <ul>
+                      {card.tips.map((tip, i) => (
+                        <li key={i}><CheckCircle2 size={12} /> {tip}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="forge-labws-soon-block">
+                    <div className="forge-labws-soon-block-title"><Wand2 size={13} /> Thông số kỹ thuật</div>
+                    <div className="forge-labws-soon-specs">
+                      <div><small>ĐỊNH DẠNG</small><div className="forge-labws-soon-fmts">{card.formats.map((f) => <em key={f}>{f}</em>)}</div></div>
+                      <div><small>THỜI GIAN</small><strong><Clock size={11} /> {card.processTime}</strong></div>
+                      <div><small>GIỚI HẠN</small><strong><Layers size={11} /> {card.maxSize}</strong></div>
+                      <div><small>TRẠNG THÁI</small><strong className={card.premium ? 'premium' : 'soon'}>{card.premium ? 'Đang lab' : 'Đang phát triển'}</strong></div>
+                    </div>
                   </div>
                 </div>
-              );
-            })}
-          </div>
 
-          <div className="forge-lab-cta">
-            <div>
-              <strong>Cần một tính năng AI cụ thể?</strong>
-              <span>Ý tưởng hay đều cân nhắc — đặc biệt nếu chạy được local không cần GPU lớn.</span>
-            </div>
-            <button type="button" className="forge-button" onClick={() => {
-              setActiveTool('files');
-              pushToast({ variant: 'info', title: 'Đã có 28 công cụ', detail: 'Khám phá File Tools' });
-            }}>
-              Xem 28 công cụ <ChevronRight size={14} />
-            </button>
-          </div>
-        </section>
+                {card.relatedIds.length > 0 ? (
+                  <div className="forge-labws-soon-related">
+                    <div className="forge-labws-soon-block-title"><Workflow size={13} /> Trong khi chờ, thử các công cụ tương tự</div>
+                    <div className="forge-labws-soon-related-row">
+                      {card.relatedIds
+                        .map((id) => aiLabCards.find((c) => c.id === id))
+                        .filter((c): c is AILabCard => !!c)
+                        .map((c) => {
+                          const RIcon =
+                            c.icon === 'eraser' ? Eraser :
+                            c.icon === 'palette' ? Palette :
+                            c.icon === 'zap' ? Zap :
+                            c.icon === 'scan' ? ScanLine :
+                            c.icon === 'languages' ? Languages :
+                            c.icon === 'mic' ? Mic :
+                            c.icon === 'wand' ? Wand2 :
+                            c.icon === 'volume' ? Volume2 :
+                            Image;
+                          return (
+                            <button key={c.id} type="button" className={`forge-labws-related-card accent-${c.accent}`} onClick={() => openLabCard(c)}>
+                              <span className="forge-labws-related-icon"><RIcon size={14} /></span>
+                              <div>
+                                <strong>{c.title}</strong>
+                                <small>{c.description.slice(0, 60)}…</small>
+                              </div>
+                              <ArrowRight size={13} />
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="forge-labws-soon-foot">
+                  <button type="button" className="forge-labws-foot-link" onClick={backToLabGrid}>← Khám phá công cụ khác</button>
+                  <button type="button" className="forge-labws-foot-cta" onClick={() => { window.open('https://github.com/TranVinhTanDat/Convert_URL/issues/new', '_blank', 'noreferrer'); }}>
+                    Yêu cầu tính năng <ArrowRight size={13} />
+                  </button>
+                </div>
+              </section>
+            );
+          }
+
+          // ============ AUDIO STUDIO (Tách nhạc & lời) ============
+          if (card.id === 'whisper') {
+            const audioRes = labAudioResult;
+            const langOptions = [
+              { code: 'auto', label: 'Auto detect' },
+              { code: 'vi', label: 'Tiếng Việt' },
+              { code: 'en', label: 'English' },
+              { code: 'zh', label: '中文' },
+              { code: 'ja', label: '日本語' },
+              { code: 'ko', label: '한국어' },
+              { code: 'fr', label: 'Français' },
+              { code: 'es', label: 'Español' }
+            ];
+            return (
+              <section className={`forge-labws accent-${card.accent} forge-audio-ws`}>
+                <header className="forge-labws-top">
+                  <button type="button" className="forge-labws-back" onClick={backToLabGrid}>
+                    <ArrowRight size={13} style={{ transform: 'rotate(180deg)' }} /> AI Lab
+                  </button>
+                  <div className="forge-labws-brand">
+                    <div className="forge-labws-brand-icon"><Icon size={16} /></div>
+                    <div>
+                      <strong>{card.title}</strong>
+                      <small>{card.tag}</small>
+                    </div>
+                  </div>
+                  <div className="forge-audio-modes" role="tablist" aria-label="Mode">
+                    <button type="button" className={labAudioMode === 'lyrics' ? 'active' : ''} onClick={() => setLabAudioMode('lyrics')}>
+                      <FileText size={12} /> Trích lời
+                    </button>
+                    <button type="button" className={labAudioMode === 'stems' ? 'active' : ''} onClick={() => setLabAudioMode('stems')}>
+                      <Layers size={12} /> Tách stems
+                      <em className="forge-audio-mode-soon">SOON</em>
+                    </button>
+                  </div>
+                </header>
+
+                {labAudioMode === 'lyrics' ? (
+                  <div className="forge-audio-body">
+                    {/* Left: input + waveform + transcript */}
+                    <div className="forge-audio-main">
+                      {/* URL input hero */}
+                      <div className="forge-audio-input-card">
+                        <div className="forge-audio-input-head">
+                          <span className="forge-audio-input-icon"><Link2 size={16} /></span>
+                          <div>
+                            <strong>URL video / audio</strong>
+                            <small>YouTube · TikTok · Vimeo · SoundCloud · Direct MP3/MP4 link</small>
+                          </div>
+                        </div>
+                        <div className="forge-audio-input-row">
+                          <Link2 size={14} />
+                          <input
+                            type="url"
+                            placeholder="https://www.youtube.com/watch?v=..."
+                            value={labAudioUrl}
+                            onChange={(e) => setLabAudioUrl(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && labAudioUrl.trim() && !labAudioBusy) runAudioWorkspace(); }}
+                          />
+                          {labAudioUrl ? (
+                            <button type="button" className="forge-audio-input-clear" onClick={() => setLabAudioUrl('')} aria-label="Clear">
+                              <XCircle size={13} />
+                            </button>
+                          ) : null}
+                        </div>
+                        <div className="forge-audio-input-examples">
+                          <span>Thử với:</span>
+                          <button type="button" onClick={() => setLabAudioUrl('https://www.youtube.com/watch?v=kffacxfA7G4')}>♪ Justin Bieber - Baby</button>
+                          <button type="button" onClick={() => setLabAudioUrl('https://www.youtube.com/watch?v=YQHsXMglC9A')}>♪ Adele - Hello</button>
+                          <button type="button" onClick={() => setLabAudioUrl('https://www.tiktok.com/@user/video/123')}>TikTok</button>
+                        </div>
+                      </div>
+
+                      {/* Waveform visualizer */}
+                      <div className="forge-audio-wave-card">
+                        {audioRes?.video.thumbnail ? (
+                          <div className="forge-audio-wave-thumb">
+                            <img src={audioRes.video.thumbnail} alt={audioRes.video.title} />
+                          </div>
+                        ) : null}
+                        <div className="forge-audio-wave-info">
+                          {audioRes ? (
+                            <>
+                              <strong title={audioRes.video.title}>{audioRes.video.title}</strong>
+                              <div className="forge-audio-wave-meta">
+                                <span>{audioRes.video.host}</span>
+                                <span>•</span>
+                                <span>{audioRes.video.durationLabel}</span>
+                                <span>•</span>
+                                <span>{audioRes.languageLabel}</span>
+                                {audioRes.source === 'whisper' ? <span className="forge-audio-tag wh">Whisper AI</span> : <span className="forge-audio-tag sub">Sub có sẵn</span>}
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <strong>Chưa có audio</strong>
+                              <div className="forge-audio-wave-meta">
+                                <span>Dán URL phía trên và bấm "Trích lời"</span>
+                              </div>
+                            </>
+                          )}
+                          {/* Waveform bars */}
+                          <div className={`forge-audio-wave ${labAudioBusy ? 'is-busy' : ''} ${audioRes ? 'is-loaded' : ''}`}>
+                            {Array.from({ length: 64 }).map((_, i) => {
+                              const h = audioRes
+                                ? 25 + Math.abs(Math.sin(i * 0.4) * 60) + (i % 5) * 4
+                                : labAudioBusy
+                                  ? 20 + Math.abs(Math.sin(i * 0.6 + Date.now() / 200) * 50)
+                                  : 8 + (i % 4) * 4;
+                              return <span key={i} style={{ height: `${Math.min(100, h)}%` }} />;
+                            })}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Transcript output */}
+                      {audioRes ? (
+                        <div className="forge-audio-output">
+                          <div className="forge-audio-output-head">
+                            <div className="forge-audio-output-tabs" role="tablist">
+                              <button type="button" className={labAudioView === 'segments' ? 'active' : ''} onClick={() => setLabAudioView('segments')}>
+                                <Clock size={11} /> Timeline
+                              </button>
+                              <button type="button" className={labAudioView === 'plain' ? 'active' : ''} onClick={() => setLabAudioView('plain')}>
+                                <FileText size={11} /> Plain text
+                              </button>
+                              <button type="button" className={labAudioView === 'markdown' ? 'active' : ''} onClick={() => setLabAudioView('markdown')}>
+                                <FileType2 size={11} /> Markdown
+                              </button>
+                              <button type="button" className={labAudioView === 'srt' ? 'active' : ''} onClick={() => setLabAudioView('srt')}>
+                                <Film size={11} /> SRT
+                              </button>
+                            </div>
+                            <div className="forge-audio-output-actions">
+                              {(() => {
+                                const text =
+                                  labAudioView === 'plain' ? audioRes.plainText :
+                                  labAudioView === 'markdown' ? audioRes.paragraphsMarkdown :
+                                  labAudioView === 'srt' ? audioRes.srt :
+                                  audioRes.segments.map(s => `[${s.startLabel}] ${s.text}`).join('\n');
+                                return (
+                                  <>
+                                    <button type="button" onClick={() => copyAudioField(text, labAudioView)}>
+                                      {labAudioCopiedField === labAudioView ? <><ClipboardCheck size={11} /> Đã copy</> : <><Clipboard size={11} /> Copy</>}
+                                    </button>
+                                    <button type="button" onClick={() => {
+                                      const safe = (audioRes.video.title || 'transcript').replace(/[<>:"/\\|?*]/g, '_').slice(0, 60);
+                                      const ext = labAudioView === 'srt' ? 'srt' : labAudioView === 'markdown' ? 'md' : 'txt';
+                                      downloadAudioFile(`${safe}.${ext}`, text);
+                                    }}>
+                                      <Download size={11} /> Tải
+                                    </button>
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          </div>
+
+                          <div className="forge-audio-output-body">
+                            {labAudioView === 'segments' ? (
+                              <div className="forge-audio-segments">
+                                {audioRes.segments.map((seg) => (
+                                  <div key={seg.index} className="forge-audio-segment">
+                                    <button
+                                      type="button"
+                                      className="forge-audio-seg-ts"
+                                      onClick={() => copyAudioField(`[${seg.startLabel}] ${seg.text}`, `seg-${seg.index}`)}
+                                      title="Copy dòng này"
+                                    >
+                                      {seg.startLabel}
+                                    </button>
+                                    <div className="forge-audio-seg-text">{seg.text}</div>
+                                    {labAudioCopiedField === `seg-${seg.index}` ? (
+                                      <span className="forge-audio-seg-copied"><CheckCircle2 size={11} /></span>
+                                    ) : null}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : labAudioView === 'plain' ? (
+                              <pre className="forge-audio-plain">{audioRes.plainText}</pre>
+                            ) : labAudioView === 'markdown' ? (
+                              <pre className="forge-audio-plain">{audioRes.paragraphsMarkdown}</pre>
+                            ) : (
+                              <pre className="forge-audio-plain">{audioRes.srt}</pre>
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    {/* Right: Controls */}
+                    <aside className="forge-labws-panel">
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Nguồn nội dung</div>
+                        <div className="forge-audio-source-info">
+                          <Link2 size={14} />
+                          <div>
+                            <strong>URL Video / Audio</strong>
+                            <small>yt-dlp tải audio tự động · không cần upload</small>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Ngôn ngữ</div>
+                        <div className="forge-audio-langs">
+                          {langOptions.map((l) => (
+                            <button
+                              key={l.code}
+                              type="button"
+                              className={`forge-audio-lang ${labAudioLang === l.code ? 'active' : ''}`}
+                              onClick={() => setLabAudioLang(l.code)}
+                            >
+                              {l.label}
+                            </button>
+                          ))}
+                        </div>
+                        <small className="forge-audio-lang-hint">Auto detect: ưu tiên sub có sẵn, fallback Whisper nếu không có.</small>
+                      </div>
+
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Engine</div>
+                        <label className="forge-audio-toggle-row">
+                          <input
+                            type="checkbox"
+                            checked={labAudioUseWhisper}
+                            onChange={(e) => setLabAudioUseWhisper(e.target.checked)}
+                          />
+                          <div>
+                            <strong>Whisper AI fallback</strong>
+                            <small>Dùng AI local khi video không có sub. Chậm hơn nhưng accurate cho music.</small>
+                          </div>
+                        </label>
+                        <div className="forge-audio-engine-flow">
+                          <div className="forge-audio-engine-step"><span>1</span><strong>yt-dlp</strong><small>Sub có sẵn</small></div>
+                          <ArrowRight size={11} />
+                          <div className={`forge-audio-engine-step ${labAudioUseWhisper ? '' : 'disabled'}`}><span>2</span><strong>Whisper</strong><small>AI fallback</small></div>
+                          <ArrowRight size={11} />
+                          <div className="forge-audio-engine-step ok"><span>✓</span><strong>Output</strong><small>4 format</small></div>
+                        </div>
+                      </div>
+
+                      <div className="forge-labws-section">
+                        {labAudioError ? (
+                          <div className="forge-labws-error">
+                            <AlertTriangle size={13} /> {labAudioError}
+                          </div>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="forge-labws-process"
+                          disabled={!labAudioUrl.trim() || labAudioBusy}
+                          onClick={runAudioWorkspace}
+                        >
+                          {labAudioBusy ? (
+                            <><Loader2 size={15} className="forge-labws-spin" /> Đang trích lời…</>
+                          ) : audioRes ? (
+                            <><Mic size={15} /> Trích lại</>
+                          ) : (
+                            <><Mic size={15} /> Trích lời</>
+                          )}
+                        </button>
+                        {audioRes ? (
+                          <div className="forge-audio-result-stats">
+                            <div><strong>{audioRes.segments.length}</strong><small>dòng</small></div>
+                            <div><strong>{audioRes.video.durationLabel}</strong><small>thời lượng</small></div>
+                            <div><strong>{audioRes.languageLabel.slice(0, 12)}</strong><small>ngôn ngữ</small></div>
+                          </div>
+                        ) : null}
+                        {audioRes?.qualityWarning ? (
+                          <div className="forge-labws-help warn" style={{ marginTop: 10 }}>
+                            <AlertTriangle size={11} /> {audioRes.qualityWarning}
+                          </div>
+                        ) : null}
+                      </div>
+
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title"><Sparkles size={11} /> Pro tips</div>
+                        <ul className="forge-labws-tips">
+                          <li><CheckCircle2 size={11} /> Music video có sub karaoke: tự động parse tag &lt;c&gt;</li>
+                          <li><CheckCircle2 size={11} /> Podcast 30+ phút: bật Whisper fallback</li>
+                          <li><CheckCircle2 size={11} /> Output Markdown phù hợp đăng blog</li>
+                          <li><CheckCircle2 size={11} /> SRT dùng cho video editor (Premiere, Davinci)</li>
+                        </ul>
+                      </div>
+                    </aside>
+                  </div>
+                ) : (
+                  /* STEMS MODE — Real Demucs separation + Web Audio mixer */
+                  (() => {
+                    const STEM_META: Record<string, { label: string; icon: string; color: string; desc: string }> = {
+                      vocals: { label: 'Vocals', icon: '🎤', color: '#EF4444', desc: 'Giọng ca chính + backing' },
+                      drums:  { label: 'Drums',  icon: '🥁', color: '#F59E0B', desc: 'Trống, hi-hat, cymbal' },
+                      bass:   { label: 'Bass',   icon: '🎸', color: '#8B5CF6', desc: 'Bass guitar + sub-bass' },
+                      other:  { label: 'Other',  icon: '🎹', color: '#0EA5E9', desc: 'Guitar, piano, synth, FX' }
+                    };
+                    const sr = labStemsResult;
+                    const fmtTime = (s: number) => {
+                      const m = Math.floor(s / 60);
+                      const ss = Math.floor(s % 60);
+                      return `${m}:${String(ss).padStart(2, '0')}`;
+                    };
+                    return (
+                      <div className="forge-audio-stems">
+                        {!sr ? (
+                          <>
+                            {/* Hero + input form */}
+                            <div className="forge-audio-stems-hero">
+                              <div className="forge-audio-stems-pill">
+                                <Wand2 size={11} /> DEMUCS v4 · AI STEM SEPARATION
+                              </div>
+                              <h2>Tách 4 stems bằng AI</h2>
+                              <p>
+                                Demucs HTDemucs v4 (state-of-the-art) tách track nhạc thành 4 stems riêng biệt: <strong>Vocals</strong>, <strong>Drums</strong>, <strong>Bass</strong>, và <strong>Other</strong>.
+                                Sẵn cho karaoke, remix, sampling, mashup, hoặc mix &amp; master lại.
+                              </p>
+                            </div>
+
+                            <div className="forge-audio-input-card">
+                              <div className="forge-audio-input-head">
+                                <span className="forge-audio-input-icon" style={{ background: 'linear-gradient(135deg, #FB923C, #EA580C)', color: '#fff' }}>
+                                  <Mic size={16} />
+                                </span>
+                                <div>
+                                  <strong>URL audio / video</strong>
+                                  <small>YouTube · SoundCloud · TikTok · Direct MP3 link · giới hạn 10 phút</small>
+                                </div>
+                              </div>
+                              <div className="forge-audio-input-row">
+                                <Link2 size={14} />
+                                <input
+                                  type="url"
+                                  placeholder="https://www.youtube.com/watch?v=..."
+                                  value={labStemsUrl}
+                                  onChange={(e) => setLabStemsUrl(e.target.value)}
+                                  onKeyDown={(e) => { if (e.key === 'Enter' && labStemsUrl.trim() && !labStemsBusy) runStemsSeparation(); }}
+                                />
+                                {labStemsUrl ? (
+                                  <button type="button" className="forge-audio-input-clear" onClick={() => setLabStemsUrl('')} aria-label="Clear">
+                                    <XCircle size={13} />
+                                  </button>
+                                ) : null}
+                              </div>
+                              <div className="forge-stems-model-picker">
+                                <div className="forge-labws-section-title" style={{ marginBottom: 8 }}>Mô hình tách</div>
+                                <div className="forge-stems-models">
+                                  {([
+                                    { id: 'htdemucs', label: 'HTDemucs', sub: 'Cân bằng nhanh + chất lượng', rec: true, time: '~3-5 min' },
+                                    { id: 'htdemucs_ft', label: 'HTDemucs FT', sub: 'Fine-tuned, vocals tách sạch hơn', rec: false, time: '~5-8 min' },
+                                    { id: 'mdx_extra', label: 'MDX Extra', sub: 'High-frequency clearer cho hi-hat', rec: false, time: '~5-7 min' }
+                                  ] as const).map((m) => (
+                                    <button
+                                      key={m.id}
+                                      type="button"
+                                      className={`forge-stems-model ${labStemsModel === m.id ? 'active' : ''}`}
+                                      onClick={() => setLabStemsModel(m.id as 'htdemucs' | 'htdemucs_ft' | 'mdx_extra')}
+                                    >
+                                      <strong>{m.label}{m.rec ? <em>khuyên dùng</em> : null}</strong>
+                                      <small>{m.sub}</small>
+                                      <span><Clock size={9} /> {m.time}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {labStemsError ? (
+                                <div className="forge-labws-error">
+                                  <AlertTriangle size={13} /> {labStemsError}
+                                </div>
+                              ) : null}
+
+                              <button
+                                type="button"
+                                className="forge-stems-process"
+                                disabled={!labStemsUrl.trim() || labStemsBusy}
+                                onClick={runStemsSeparation}
+                              >
+                                {labStemsBusy ? (
+                                  <><Loader2 size={15} className="forge-labws-spin" /> Đang tách stems (có thể mất vài phút)…</>
+                                ) : (
+                                  <><Wand2 size={15} /> Tách 4 stems</>
+                                )}
+                              </button>
+
+                              {labStemsBusy ? (
+                                <div className="forge-stems-busy-pipeline">
+                                  <div className="forge-stems-busy-step active"><span>1</span><div><strong>Tải audio</strong><small>yt-dlp đang lấy file WAV</small></div></div>
+                                  <div className="forge-stems-busy-step active"><span>2</span><div><strong>Demucs AI</strong><small>Phân tích spectrogram + neural net</small></div></div>
+                                  <div className="forge-stems-busy-step active"><span>3</span><div><strong>Export</strong><small>4 file MP3 + instrumental mix</small></div></div>
+                                </div>
+                              ) : null}
+                            </div>
+
+                            <div className="forge-audio-stems-tech">
+                              <div className="forge-audio-stems-tech-block">
+                                <div className="forge-labws-section-title"><Sparkles size={11} /> Lưu ý kỹ thuật</div>
+                                <ul>
+                                  <li><CheckCircle2 size={11} /> Server CPU mode — không cần GPU nhưng chậm hơn (~3-8 phút / bài 3-4 phút)</li>
+                                  <li><CheckCircle2 size={11} /> Output MP3 256 kbps · 44.1 kHz · stereo</li>
+                                  <li><CheckCircle2 size={11} /> Tự sinh instrumental track (drums + bass + other) cho karaoke</li>
+                                  <li><CheckCircle2 size={11} /> Solo / mute / volume từng stem trong browser</li>
+                                  <li><CheckCircle2 size={11} /> Giới hạn 10 phút audio để tránh OOM</li>
+                                </ul>
+                              </div>
+                              <div className="forge-audio-stems-tech-block">
+                                <div className="forge-labws-section-title"><Wand2 size={11} /> So sánh model</div>
+                                <div className="forge-stems-compare">
+                                  <div><strong>HTDemucs</strong><small>Default · 4 stems · best speed/quality</small></div>
+                                  <div><strong>HTDemucs FT</strong><small>Fine-tuned · vocals cleaner · slower</small></div>
+                                  <div><strong>MDX Extra</strong><small>MDX-Net · hi-freq detail · slower</small></div>
+                                </div>
+                                <small style={{ fontSize: 10.5, color: '#94A3B8', marginTop: 8, display: 'block' }}>Demucs v4 (Meta AI 2023): state-of-the-art trên MUSDB18-HQ benchmark.</small>
+                              </div>
+                            </div>
+                          </>
+                        ) : (
+                          /* Result: full mixer */
+                          <>
+                            <div className="forge-stems-result-head">
+                              {sr.thumbnail ? (
+                                <div className="forge-stems-thumb"><img src={sr.thumbnail} alt={sr.title} /></div>
+                              ) : null}
+                              <div className="forge-stems-result-meta">
+                                <strong>{sr.title}</strong>
+                                <div className="forge-stems-meta-row">
+                                  <span><Clock size={11} /> {sr.durationLabel}</span>
+                                  <span>•</span>
+                                  <span>{sr.stems.length} stems</span>
+                                  <span>•</span>
+                                  <span className="forge-stems-model-tag">{sr.model}</span>
+                                </div>
+                                <div className="forge-stems-transport">
+                                  <button type="button" className="forge-stems-play" onClick={toggleStemsPlay}>
+                                    {labStemsPlaying ? (
+                                      <>⏸ Pause</>
+                                    ) : (
+                                      <>▶ Play tất cả</>
+                                    )}
+                                  </button>
+                                  <button type="button" className="forge-stems-stop" onClick={stopAllStems} title="Stop">⏹</button>
+                                  <div className="forge-stems-time">
+                                    {fmtTime(labStemsCurrentTime)} / {fmtTime(labStemsDuration)}
+                                  </div>
+                                  <input
+                                    type="range"
+                                    className="forge-stems-seek"
+                                    min={0}
+                                    max={labStemsDuration || 0}
+                                    step={0.1}
+                                    value={labStemsCurrentTime}
+                                    onChange={(e) => seekStems(Number(e.target.value))}
+                                  />
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                className="forge-stems-new"
+                                onClick={() => {
+                                  stopAllStems();
+                                  setLabStemsResult(null);
+                                  setLabStemsUrl('');
+                                }}
+                              >
+                                <UploadCloud size={12} /> Bài mới
+                              </button>
+                            </div>
+
+                            <div className="forge-audio-stems-grid">
+                              {sr.stems.map((stem: StemsStem) => {
+                                const meta = STEM_META[stem.name] || { label: stem.label, icon: '🎵', color: '#94A3B8', desc: '' };
+                                const muted = labStemsMuted[stem.name];
+                                const isSoloed = labStemsSolo === stem.name;
+                                const dimmed = labStemsSolo && labStemsSolo !== stem.name;
+                                return (
+                                  <div
+                                    key={stem.name}
+                                    className={`forge-audio-stem-card real ${muted ? 'is-muted' : ''} ${dimmed ? 'is-dimmed' : ''} ${isSoloed ? 'is-solo' : ''}`}
+                                    style={{ borderTop: `3px solid ${meta.color}` }}
+                                  >
+                                    <audio
+                                      ref={(el) => { labStemsAudioRefs.current[stem.name] = el; }}
+                                      src={stem.streamUrl}
+                                      preload="auto"
+                                      onLoadedMetadata={(e) => {
+                                        const a = e.currentTarget;
+                                        a.volume = getStemEffectiveVolume(stem.name);
+                                        if (stem.name === sr.stems[0]?.name && a.duration && !labStemsDuration) {
+                                          setLabStemsDuration(a.duration);
+                                        }
+                                      }}
+                                    />
+                                    <div className="forge-audio-stem-head">
+                                      <div className="forge-audio-stem-emoji" style={{ background: `${meta.color}22`, color: meta.color }}>{meta.icon}</div>
+                                      <div>
+                                        <strong>{meta.label}</strong>
+                                        <small>{meta.desc}</small>
+                                      </div>
+                                      <div className="forge-audio-stem-actions">
+                                        <button
+                                          type="button"
+                                          title="Solo"
+                                          className={isSoloed ? 'on' : ''}
+                                          onClick={() => toggleStemSolo(stem.name)}
+                                        >S</button>
+                                        <button
+                                          type="button"
+                                          title="Mute"
+                                          className={muted ? 'on' : ''}
+                                          onClick={() => toggleStemMute(stem.name)}
+                                        >M</button>
+                                      </div>
+                                    </div>
+                                    <div className="forge-audio-stem-wave" style={{ ['--stem-color' as never]: meta.color } as React.CSSProperties}>
+                                      {Array.from({ length: 48 }).map((_, i) => {
+                                        const h = 20 + Math.abs(Math.sin(i * 0.4 + stem.name.length) * 70);
+                                        const progressPct = labStemsDuration > 0 ? labStemsProgress * 100 : 0;
+                                        const barPct = (i / 48) * 100;
+                                        const isPast = barPct < progressPct;
+                                        return <span key={i} style={{ height: `${h}%`, opacity: isPast ? 1 : 0.45 }} />;
+                                      })}
+                                    </div>
+                                    <div className="forge-audio-stem-foot">
+                                      <div className="forge-audio-stem-volume">
+                                        <span>Vol</span>
+                                        <input
+                                          type="range"
+                                          min={0}
+                                          max={100}
+                                          value={labStemsVolumes[stem.name]}
+                                          onChange={(e) => setStemVolume(stem.name, Number(e.target.value))}
+                                        />
+                                        <em>{labStemsVolumes[stem.name]}%</em>
+                                      </div>
+                                      <a
+                                        href={stem.downloadUrl}
+                                        download={stem.fileName}
+                                        className="forge-audio-stem-download active"
+                                      >
+                                        <Download size={11} /> MP3 {formatBytes(stem.size)}
+                                      </a>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+
+                            {sr.instrumentalUrl ? (
+                              <div className="forge-stems-karaoke">
+                                <div className="forge-stems-karaoke-head">
+                                  <div className="forge-stems-karaoke-icon">🎤</div>
+                                  <div>
+                                    <strong>Karaoke / Instrumental</strong>
+                                    <small>Mix tự động (drums + bass + other) — không có vocals, hát theo được ngay</small>
+                                  </div>
+                                  <a href={sr.instrumentalUrl} download={`${sr.title.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40)}_instrumental.mp3`} className="forge-stems-karaoke-dl">
+                                    <Download size={13} /> Tải instrumental
+                                  </a>
+                                </div>
+                              </div>
+                            ) : null}
+
+                            <div className="forge-stems-tips">
+                              <div className="forge-labws-section-title"><Sparkles size={11} /> Workflow gợi ý</div>
+                              <div className="forge-stems-tips-grid">
+                                <div className="forge-stems-tip"><strong>🎤 Karaoke</strong><small>Mute Vocals → tải instrumental → hát theo / ghi vocal mới</small></div>
+                                <div className="forge-stems-tip"><strong>🎧 Remix</strong><small>Solo Drums + Bass → loop làm beat backing track</small></div>
+                                <div className="forge-stems-tip"><strong>🎵 Acapella</strong><small>Solo Vocals → download → mash up với beat khác</small></div>
+                                <div className="forge-stems-tip"><strong>📚 Học</strong><small>Solo Bass / Other → cover guitar / piano dễ hơn</small></div>
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()
+                )}
+              </section>
+            );
+          }
+
+          // Active workspace
+          const action = card.action;
+          if (!action) return null;
+          const toolId = action.tool;
+          const hasResult = !!labWsResult;
+          const canProcess = !!labWsFile && !labWsBusy;
+
+          return (
+            <section className={`forge-labws accent-${card.accent}`}>
+              {/* Top bar */}
+              <header className="forge-labws-top">
+                <button type="button" className="forge-labws-back" onClick={backToLabGrid}>
+                  <ArrowRight size={13} style={{ transform: 'rotate(180deg)' }} /> AI Lab
+                </button>
+                <div className="forge-labws-brand">
+                  <div className="forge-labws-brand-icon"><Icon size={16} /></div>
+                  <div>
+                    <strong>{card.title}</strong>
+                    <small>{card.tag}</small>
+                  </div>
+                </div>
+                <div className="forge-labws-top-meta">
+                  <span><Clock size={11} /> {card.processTime}</span>
+                  <span><Layers size={11} /> {card.maxSize}</span>
+                </div>
+              </header>
+
+              <div className="forge-labws-body">
+                {/* Left: Canvas */}
+                <div className="forge-labws-canvas">
+                  {!labWsFile ? (
+                    <div
+                      className={`forge-labws-drop ${labWsDragging ? 'is-drag' : ''}`}
+                      onDragOver={(e) => { e.preventDefault(); setLabWsDragging(true); }}
+                      onDragLeave={() => setLabWsDragging(false)}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        setLabWsDragging(false);
+                        const f = e.dataTransfer.files[0];
+                        if (f) handleLabWsFile(f);
+                      }}
+                      onClick={() => labWsInputRef.current?.click()}
+                      onPaste={(e) => {
+                        const item = Array.from(e.clipboardData.items).find((i) => i.type.startsWith('image/'));
+                        const f = item?.getAsFile();
+                        if (f) handleLabWsFile(f);
+                      }}
+                      tabIndex={0}
+                    >
+                      <input
+                        ref={labWsInputRef}
+                        type="file"
+                        accept="image/*"
+                        hidden
+                        onChange={(e) => { const f = e.target.files?.[0]; if (f) handleLabWsFile(f); }}
+                      />
+                      <div className={`forge-labws-drop-icon accent-${card.accent}`}>
+                        <UploadCloud size={28} />
+                      </div>
+                      <strong>Thả ảnh vào đây</strong>
+                      <span>hoặc click chọn từ máy · paste từ clipboard (Ctrl+V)</span>
+                      <div className="forge-labws-drop-formats">
+                        {card.formats.map((f) => <em key={f}>{f}</em>)}
+                      </div>
+                      <div className="forge-labws-drop-divider"><span>hoặc</span></div>
+                      <button
+                        type="button"
+                        className="forge-labws-drop-sample"
+                        onClick={(e) => { e.stopPropagation(); loadLabSample(toolId); }}
+                      >
+                        <Sparkles size={13} /> Thử với ảnh mẫu
+                      </button>
+                    </div>
+                  ) : (
+                    <div
+                      className={`forge-labws-canvas-stage bg-${labWsBg}`}
+                      style={labWsBg === 'custom' ? { background: labWsBgCustom } : undefined}
+                    >
+                      {hasResult ? (
+                        <div
+                          className="forge-labws-compare"
+                          onMouseMove={(e) => {
+                            const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+                            const x = ((e.clientX - rect.left) / rect.width) * 100;
+                            setLabWsComparePos(Math.max(0, Math.min(100, x)));
+                          }}
+                        >
+                          <img src={labWsPreview} alt="Trước" className="forge-labws-compare-before" />
+                          <div className="forge-labws-compare-after" style={{ clipPath: `inset(0 0 0 ${labWsComparePos}%)` }}>
+                            <img src={labWsResult.downloadUrl} alt="Sau" />
+                          </div>
+                          <div className="forge-labws-compare-handle" style={{ left: `${labWsComparePos}%` }}>
+                            <span><ChevronRight size={11} style={{ transform: 'rotate(180deg)' }} /><ChevronRight size={11} /></span>
+                          </div>
+                          <div className="forge-labws-compare-label left">TRƯỚC</div>
+                          <div className="forge-labws-compare-label right">SAU</div>
+                        </div>
+                      ) : (
+                        <div className="forge-labws-canvas-imgwrap">
+                          <img
+                            src={labWsPreview}
+                            alt="Preview"
+                            className="forge-labws-canvas-img"
+                            ref={labInpaintImageRef}
+                            onLoad={() => { if (toolId === 'remove-object') initInpaintCanvas(); }}
+                          />
+                          {toolId === 'remove-object' && labInpaintMode === 'subject' && labInpaintAutoMask ? (
+                            <>
+                              <img
+                                src={labInpaintAutoMask}
+                                alt="Detected subject"
+                                className="forge-inpaint-auto-overlay"
+                                aria-hidden="true"
+                              />
+                              <div className="forge-inpaint-detection-hint">
+                                <Sparkles size={11} /> Vùng đỏ sẽ bị xoá khi bấm "Xoá vật thể"
+                              </div>
+                            </>
+                          ) : null}
+                          {toolId === 'remove-object' && labInpaintMode === 'smart' && labDetectResult ? (
+                            <div className="forge-obj-overlay" aria-hidden="true">
+                              {labDetectResult.objects.map((obj) => {
+                                const removing = labRemoveIds.has(obj.id);
+                                const [bx, by, bw, bh] = obj.bbox;
+                                const left = (bx / labDetectResult.width) * 100;
+                                const top = (by / labDetectResult.height) * 100;
+                                const w = (bw / labDetectResult.width) * 100;
+                                const h = (bh / labDetectResult.height) * 100;
+                                return (
+                                  <div
+                                    key={obj.id}
+                                    className={`forge-obj-bbox ${removing ? 'removing' : 'keeping'} ${labHoverObjId === obj.id ? 'hover' : ''}`}
+                                    style={{ left: `${left}%`, top: `${top}%`, width: `${w}%`, height: `${h}%` }}
+                                  >
+                                    <span className="forge-obj-bbox-label">
+                                      {removing ? '✕' : '✓'} {obj.labelVi}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                              <div className="forge-inpaint-detection-hint">
+                                <Layers size={11} /> Đỏ = xoá · Xanh = giữ · click trong panel để đổi
+                              </div>
+                            </div>
+                          ) : null}
+                          {toolId === 'remove-object' && labInpaintMode === 'manual' ? (
+                            <canvas
+                              ref={labInpaintMaskCanvasRef}
+                              className="forge-inpaint-canvas"
+                              style={{
+                                cursor: labInpaintTool === 'eraser'
+                                  ? `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="%23047857" stroke-width="2"><circle cx="12" cy="12" r="${Math.max(4, labInpaintBrushSize / 8)}"/></svg>') 12 12, crosshair`
+                                  : `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="%23f43f5e" stroke-width="2"><circle cx="12" cy="12" r="${Math.max(4, labInpaintBrushSize / 8)}"/></svg>') 12 12, crosshair`
+                              }}
+                              onMouseDown={(e) => {
+                                labInpaintIsDrawingRef.current = true;
+                                labInpaintLastPosRef.current = null;
+                                const p = inpaintCanvasCoords(e);
+                                if (p) inpaintDrawAt(p.x, p.y);
+                              }}
+                              onMouseMove={(e) => {
+                                if (!labInpaintIsDrawingRef.current) return;
+                                const p = inpaintCanvasCoords(e);
+                                if (p) inpaintDrawAt(p.x, p.y);
+                              }}
+                              onMouseUp={() => {
+                                labInpaintIsDrawingRef.current = false;
+                                labInpaintLastPosRef.current = null;
+                              }}
+                              onMouseLeave={() => {
+                                labInpaintIsDrawingRef.current = false;
+                                labInpaintLastPosRef.current = null;
+                              }}
+                              onTouchStart={(e) => {
+                                e.preventDefault();
+                                labInpaintIsDrawingRef.current = true;
+                                labInpaintLastPosRef.current = null;
+                                const p = inpaintCanvasCoords(e);
+                                if (p) inpaintDrawAt(p.x, p.y);
+                              }}
+                              onTouchMove={(e) => {
+                                e.preventDefault();
+                                if (!labInpaintIsDrawingRef.current) return;
+                                const p = inpaintCanvasCoords(e);
+                                if (p) inpaintDrawAt(p.x, p.y);
+                              }}
+                              onTouchEnd={() => {
+                                labInpaintIsDrawingRef.current = false;
+                                labInpaintLastPosRef.current = null;
+                              }}
+                            />
+                          ) : null}
+                          {toolId === 'crop-image' && labWsShowGrid && labWsSrcDims ? (
+                            <div className="forge-labws-rot-grid" aria-hidden="true">
+                              <span className="rot-v rot-v1" /><span className="rot-v rot-v2" />
+                              <span className="rot-h rot-h1" /><span className="rot-h rot-h2" />
+                            </div>
+                          ) : null}
+                          {toolId === 'crop-image' && labWsSrcDims ? (() => {
+                            const aspectMap: Record<string, [number, number]> = {
+                              'square': [1, 1], '4:3': [4, 3], '3:2': [3, 2],
+                              '16:9': [16, 9], '9:16': [9, 16], '3:4': [3, 4], '2:3': [2, 3]
+                            };
+                            const aspect = String(labWsOptions.aspect ?? 'square');
+                            const ratio = aspectMap[aspect];
+                            if (!ratio) return null;
+                            const [rw, rh] = ratio;
+                            const srcAspect = labWsSrcDims.w / labWsSrcDims.h;
+                            const tgtAspect = rw / rh;
+                            // Compute % of source that the crop covers
+                            let pctW: number, pctH: number;
+                            if (tgtAspect > srcAspect) {
+                              pctW = 100;
+                              pctH = (srcAspect / tgtAspect) * 100;
+                            } else {
+                              pctH = 100;
+                              pctW = (tgtAspect / srcAspect) * 100;
+                            }
+                            const left = (100 - pctW) / 2;
+                            const top = (100 - pctH) / 2;
+                            return (
+                              <div
+                                className="forge-labws-crop-overlay"
+                                style={{
+                                  left: `${left}%`,
+                                  top: `${top}%`,
+                                  width: `${pctW}%`,
+                                  height: `${pctH}%`
+                                }}
+                                aria-hidden="true"
+                              >
+                                <span className="cop-corner tl" /><span className="cop-corner tr" />
+                                <span className="cop-corner bl" /><span className="cop-corner br" />
+                                <span className="cop-label">{aspect.toUpperCase()}</span>
+                              </div>
+                            );
+                          })() : null}
+                        </div>
+                      )}
+                      <div className="forge-labws-canvas-actions">
+                        {hasResult ? (
+                          <div className="forge-labws-bg-swap" role="group" aria-label="Nền hiển thị">
+                            <button type="button" className={labWsBg === 'checker' ? 'active' : ''} onClick={() => setLabWsBg('checker')} title="Checkerboard">⊞</button>
+                            <button type="button" className={labWsBg === 'white' ? 'active' : ''} onClick={() => setLabWsBg('white')} title="Trắng" style={{ background: '#fff' }}>　</button>
+                            <button type="button" className={labWsBg === 'black' ? 'active' : ''} onClick={() => setLabWsBg('black')} title="Đen" style={{ background: '#000' }}>　</button>
+                            <button type="button" className={labWsBg === 'emerald' ? 'active' : ''} onClick={() => setLabWsBg('emerald')} title="Emerald" style={{ background: '#047857' }}>　</button>
+                          </div>
+                        ) : (
+                          <button type="button" className="forge-labws-canvas-change" onClick={() => labWsInputRef.current?.click()}>
+                            <UploadCloud size={12} /> Đổi ảnh
+                          </button>
+                        )}
+                        <input
+                          ref={labWsInputRef}
+                          type="file"
+                          accept="image/*"
+                          hidden
+                          onChange={(e) => { const f = e.target.files?.[0]; if (f) handleLabWsFile(f); }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Right: Controls */}
+                <aside className="forge-labws-panel">
+                  {/* Source inspector (after upload) */}
+                  {labWsFile ? (
+                    <div className="forge-labws-section forge-labws-inspector">
+                      <div className="forge-labws-inspector-row">
+                        <span className="forge-labws-inspector-label">FILE GỐC</span>
+                        <button
+                          type="button"
+                          className="forge-labws-inspector-swap"
+                          title="Đổi ảnh khác"
+                          onClick={() => labWsInputRef.current?.click()}
+                        >
+                          <UploadCloud size={11} /> Đổi
+                        </button>
+                      </div>
+                      <div className="forge-labws-inspector-name" title={labWsFile.name}>
+                        {labWsFile.name}
+                      </div>
+                      <div className="forge-labws-inspector-stats">
+                        <div>
+                          <small>Kích thước</small>
+                          <strong>{labWsSrcDims ? `${labWsSrcDims.w} × ${labWsSrcDims.h}` : '—'}</strong>
+                        </div>
+                        <div>
+                          <small>Độ phân giải</small>
+                          <strong>{labWsSrcDims ? megapixels(labWsSrcDims.w, labWsSrcDims.h) : '—'}</strong>
+                        </div>
+                        <div>
+                          <small>Dung lượng</small>
+                          <strong>{formatBytes(labWsFile.size)}</strong>
+                        </div>
+                        <div>
+                          <small>Định dạng</small>
+                          <strong>{(labWsFile.type.split('/')[1] || 'image').toUpperCase()}</strong>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {/* Result inspector (after process) */}
+                  {hasResult && labWsResult ? (
+                    (() => {
+                      const srcBytes = labWsFile?.size ?? 0;
+                      const delta = srcBytes > 0 ? ((labWsResult.size - srcBytes) / srcBytes) * 100 : 0;
+                      const savings = -delta;
+                      const isLarger = labWsResult.size > srcBytes;
+                      return (
+                        <div className="forge-labws-section forge-labws-inspector forge-labws-inspector-result">
+                          <div className="forge-labws-inspector-row">
+                            <span className="forge-labws-inspector-label ok">
+                              <CheckCircle2 size={11} /> KẾT QUẢ
+                            </span>
+                            <span className={`forge-labws-inspector-delta ${isLarger ? 'up' : 'down'}`}>
+                              {isLarger ? '↑' : '↓'} {Math.abs(savings).toFixed(0)}%
+                            </span>
+                          </div>
+                          <div className="forge-labws-inspector-name" title={labWsResult.fileName}>
+                            {labWsResult.fileName}
+                          </div>
+                          <div className="forge-labws-inspector-stats">
+                            <div>
+                              <small>Kích thước mới</small>
+                              <strong>{labWsResultDims ? `${labWsResultDims.w} × ${labWsResultDims.h}` : '—'}</strong>
+                            </div>
+                            <div>
+                              <small>Độ phân giải</small>
+                              <strong>{labWsResultDims ? megapixels(labWsResultDims.w, labWsResultDims.h) : '—'}</strong>
+                            </div>
+                            <div>
+                              <small>Dung lượng</small>
+                              <strong>{formatBytes(labWsResult.size)}</strong>
+                            </div>
+                            <div>
+                              <small>{isLarger ? 'Tăng so với gốc' : 'Tiết kiệm'}</small>
+                              <strong className={isLarger ? 'up' : 'down'}>{isLarger ? '+' : ''}{delta.toFixed(0)}%</strong>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()
+                  ) : null}
+
+                  {/* Tool-specific options */}
+                  {toolId === 'remove-background' ? (
+                    <>
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Mô hình AI</div>
+                        <div className="forge-labws-models">
+                          {[
+                            { id: 'u2net', label: 'U2Net', sub: 'Cân bằng, tổng quát', rec: true, time: '~3s' },
+                            { id: 'isnet-general-use', label: 'IS-Net General', sub: 'Chất lượng cao, viền mịn', time: '~5s' },
+                            { id: 'silueta', label: 'Silueta', sub: 'Tối ưu chân dung', time: '~3s' },
+                            { id: 'isnet-anime', label: 'IS-Net Anime', sub: 'Ảnh vẽ / anime', time: '~5s' },
+                            { id: 'u2netp', label: 'U2NetP', sub: 'Nhẹ, nhanh nhất', time: '~2s' }
+                          ].map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              className={`forge-labws-model ${labWsOptions.model === m.id ? 'active' : ''}`}
+                              onClick={() => setLabWsOption('model', m.id)}
+                            >
+                              <strong>{m.label}{m.rec ? <em>khuyên dùng</em> : null}</strong>
+                              <small>{m.sub}</small>
+                              <span className="forge-labws-model-time"><Clock size={9} /> {m.time}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Background replacement (visible after result) */}
+                      {hasResult ? (
+                        <div className="forge-labws-section">
+                          <div className="forge-labws-section-title">Nền hiển thị</div>
+                          <div className="forge-labws-bg-grid">
+                            <button
+                              type="button"
+                              className={`forge-labws-bg-tile ${labWsBg === 'checker' ? 'active' : ''}`}
+                              onClick={() => setLabWsBg('checker')}
+                              title="Transparent (checker)"
+                            >
+                              <span className="forge-labws-bg-tile-vis checker" />
+                              <small>Trong suốt</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`forge-labws-bg-tile ${labWsBg === 'white' ? 'active' : ''}`}
+                              onClick={() => setLabWsBg('white')}
+                            >
+                              <span className="forge-labws-bg-tile-vis" style={{ background: '#fff', border: '1px solid #E5E7EB' }} />
+                              <small>Trắng</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`forge-labws-bg-tile ${labWsBg === 'black' ? 'active' : ''}`}
+                              onClick={() => setLabWsBg('black')}
+                            >
+                              <span className="forge-labws-bg-tile-vis" style={{ background: '#0F172A' }} />
+                              <small>Đen</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`forge-labws-bg-tile ${labWsBg === 'emerald' ? 'active' : ''}`}
+                              onClick={() => setLabWsBg('emerald')}
+                            >
+                              <span className="forge-labws-bg-tile-vis" style={{ background: '#047857' }} />
+                              <small>Studio</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`forge-labws-bg-tile ${labWsBg === 'custom' ? 'active' : ''}`}
+                              onClick={() => setLabWsBg('custom')}
+                            >
+                              <span className="forge-labws-bg-tile-vis" style={{ background: labWsBgCustom }} />
+                              <small>Tuỳ chọn</small>
+                            </button>
+                          </div>
+                          {labWsBg === 'custom' ? (
+                            <div className="forge-labws-color-input" style={{ marginTop: 10 }}>
+                              <input
+                                type="color"
+                                value={labWsBgCustom}
+                                onChange={(e) => setLabWsBgCustom(e.target.value)}
+                              />
+                              <input
+                                type="text"
+                                value={labWsBgCustom}
+                                onChange={(e) => setLabWsBgCustom(e.target.value)}
+                              />
+                            </div>
+                          ) : null}
+                          <div className="forge-labws-help">
+                            <Sparkles size={11} /> File PNG kết quả có alpha — đặt lên bất kỳ background nào. Đây chỉ là preview.
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+
+                  {toolId === 'upscale-image' ? (
+                    (() => {
+                      const scale = String(labWsOptions.scale ?? '2x');
+                      const scaleN = scale === '4x' ? 4 : scale === '3x' ? 3 : 2;
+                      const targetW = labWsSrcDims ? Math.min(6000, labWsSrcDims.w * scaleN) : 0;
+                      const targetH = labWsSrcDims ? Math.round(targetW * (labWsSrcDims.h / Math.max(1, labWsSrcDims.w))) : 0;
+                      const estBytes = labWsFile ? estimateUpscaledBytes(labWsFile.size, scaleN) : 0;
+                      const willCap = labWsSrcDims ? (labWsSrcDims.w * scaleN > 6000) : false;
+                      return (
+                        <div className="forge-labws-section">
+                          <div className="forge-labws-section-title">Tỉ lệ phóng</div>
+                          <div className="forge-labws-scales">
+                            {[
+                              { id: '2x', label: '2×', sub: 'Đôi kích thước', rec: true },
+                              { id: '3x', label: '3×', sub: 'Phóng vừa' },
+                              { id: '4x', label: '4×', sub: 'Tối đa, cạnh ≤ 6000px' }
+                            ].map((s) => (
+                              <button
+                                key={s.id}
+                                type="button"
+                                className={`forge-labws-scale ${labWsOptions.scale === s.id ? 'active' : ''}`}
+                                onClick={() => setLabWsOption('scale', s.id)}
+                              >
+                                <span className="forge-labws-scale-num">{s.label}</span>
+                                <strong>{s.sub}</strong>
+                                {s.rec ? <em>khuyên dùng</em> : null}
+                              </button>
+                            ))}
+                          </div>
+
+                          {labWsSrcDims ? (
+                            <div className="forge-labws-upscale-preview">
+                              <div className="forge-labws-upscale-arrow">
+                                <div className="forge-labws-upscale-side">
+                                  <small>TRƯỚC</small>
+                                  <strong>{labWsSrcDims.w} × {labWsSrcDims.h}</strong>
+                                  <span>{megapixels(labWsSrcDims.w, labWsSrcDims.h)} · {formatBytes(labWsFile?.size ?? 0)}</span>
+                                </div>
+                                <ArrowRight size={16} />
+                                <div className="forge-labws-upscale-side ok">
+                                  <small>SAU ({scale.toUpperCase()})</small>
+                                  <strong>{targetW} × {targetH}</strong>
+                                  <span>{megapixels(targetW, targetH)} · ~{formatBytes(estBytes)}</span>
+                                </div>
+                              </div>
+                              {willCap ? (
+                                <div className="forge-labws-help warn">
+                                  <AlertTriangle size={11} /> Sẽ bị giới hạn ở 6000px cạnh dài. Output thực tế có thể nhỏ hơn {scaleN}×.
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
+
+                          <div className="forge-labws-help">
+                            <Sparkles size={11} /> Pipeline: Lanczos resampling + unsharp mask. Ảnh blur sẵn không thể "tạo" thêm chi tiết.
+                          </div>
+                        </div>
+                      );
+                    })()
+                  ) : null}
+
+                  {toolId === 'chroma-key' ? (
+                    <div className="forge-labws-section">
+                      <div className="forge-labws-section-title">Chọn màu nền</div>
+                      <div className="forge-labws-chroma-targets">
+                        {[
+                          { id: 'auto', label: 'Auto detect', hint: 'Lấy màu trung bình 4 góc' },
+                          { id: 'custom', label: 'Tự nhập HEX', hint: 'Pick chính xác' }
+                        ].map((t) => (
+                          <button
+                            key={t.id}
+                            type="button"
+                            className={`forge-labws-chroma-target ${(labWsOptions.target ?? 'auto') === t.id ? 'active' : ''}`}
+                            onClick={() => setLabWsOption('target', t.id)}
+                          >
+                            <strong>{t.label}</strong>
+                            <small>{t.hint}</small>
+                          </button>
+                        ))}
+                      </div>
+                      {labWsOptions.target === 'custom' ? (
+                        <div className="forge-labws-field">
+                          <label>
+                            Mã màu HEX
+                            <button
+                              type="button"
+                              className="forge-labws-eyedropper"
+                              onClick={pickColorWithEyeDropper}
+                              title="Pick màu từ màn hình"
+                            >
+                              <Sparkles size={10} /> EyeDropper
+                            </button>
+                          </label>
+                          <div className="forge-labws-color-input">
+                            <input
+                              type="color"
+                              value={String(labWsOptions.color ?? '#ffffff')}
+                              onChange={(e) => setLabWsOption('color', e.target.value)}
+                            />
+                            <input
+                              type="text"
+                              value={String(labWsOptions.color ?? '#ffffff')}
+                              onChange={(e) => setLabWsOption('color', e.target.value)}
+                              placeholder="#ffffff"
+                            />
+                            <div className="forge-labws-color-swatches">
+                              {['#ffffff', '#000000', '#22c55e', '#0066ff', '#FB923C', '#1e293b', '#fef3c7'].map((hex) => (
+                                <button key={hex} type="button" onClick={() => setLabWsOption('color', hex)} style={{ background: hex }} title={hex} />
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div className="forge-labws-field">
+                        <label>Dung sai màu <em>{labWsOptions.tolerance ?? 32}</em></label>
+                        <input
+                          type="range"
+                          min={0}
+                          max={120}
+                          value={Number(labWsOptions.tolerance ?? 32)}
+                          onChange={(e) => setLabWsOption('tolerance', Number(e.target.value))}
+                        />
+                        <small>Cao = ăn sâu vào subject. Thấp = sót viền</small>
+                      </div>
+                      <div className="forge-labws-field">
+                        <label>Mềm cạnh (feather) <em>{labWsOptions.feather ?? 12}</em></label>
+                        <input
+                          type="range"
+                          min={0}
+                          max={60}
+                          value={Number(labWsOptions.feather ?? 12)}
+                          onChange={(e) => setLabWsOption('feather', Number(e.target.value))}
+                        />
+                        <small>Gradient alpha quanh viền, tránh răng cưa</small>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {toolId === 'crop-image' ? (
+                    <div className="forge-labws-section">
+                      <div className="forge-labws-section-title">Tỉ lệ crop</div>
+                      <div className="forge-labws-ratios">
+                        {[
+                          { id: 'square', label: '1:1', sub: 'Instagram', w: 1, h: 1 },
+                          { id: '16:9', label: '16:9', sub: 'YouTube', w: 16, h: 9 },
+                          { id: '4:3', label: '4:3', sub: 'Sách', w: 4, h: 3 },
+                          { id: '3:2', label: '3:2', sub: 'DSLR', w: 3, h: 2 },
+                          { id: '9:16', label: '9:16', sub: 'Story', w: 9, h: 16 },
+                          { id: '3:4', label: '3:4', sub: 'Portrait', w: 3, h: 4 }
+                        ].map((r) => (
+                          <button
+                            key={r.id}
+                            type="button"
+                            className={`forge-labws-ratio ${(labWsOptions.aspect ?? 'square') === r.id ? 'active' : ''}`}
+                            onClick={() => setLabWsOption('aspect', r.id)}
+                          >
+                            <span className="forge-labws-ratio-vis" style={{ aspectRatio: `${r.w}/${r.h}` }} />
+                            <strong>{r.label}</strong>
+                            <small>{r.sub}</small>
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          className={`forge-labws-ratio ${labWsOptions.aspect === 'custom' ? 'active' : ''}`}
+                          onClick={() => setLabWsOption('aspect', 'custom')}
+                        >
+                          <span className="forge-labws-ratio-vis" style={{ aspectRatio: '1/1', border: '1.5px dashed currentColor', background: 'transparent' }} />
+                          <strong>Custom</strong>
+                          <small>Nhập W×H</small>
+                        </button>
+                      </div>
+                      {labWsOptions.aspect === 'custom' ? (
+                        <>
+                          <div className="forge-labws-row2" style={{ marginTop: 10 }}>
+                            <div className="forge-labws-field">
+                              <label>Width (px)</label>
+                              <input type="number" min={1} step={10} value={Number(labWsOptions.width ?? 1000)} onChange={(e) => setLabWsOption('width', Number(e.target.value))} />
+                            </div>
+                            <div className="forge-labws-field">
+                              <label>Height (px)</label>
+                              <input type="number" min={1} step={10} value={Number(labWsOptions.height ?? 1000)} onChange={(e) => setLabWsOption('height', Number(e.target.value))} />
+                            </div>
+                          </div>
+                          <div className="forge-labws-row2">
+                            <div className="forge-labws-field">
+                              <label>Vị trí X</label>
+                              <input type="number" min={0} step={10} value={Number(labWsOptions.x ?? 0)} onChange={(e) => setLabWsOption('x', Number(e.target.value))} />
+                            </div>
+                            <div className="forge-labws-field">
+                              <label>Vị trí Y</label>
+                              <input type="number" min={0} step={10} value={Number(labWsOptions.y ?? 0)} onChange={(e) => setLabWsOption('y', Number(e.target.value))} />
+                            </div>
+                          </div>
+                        </>
+                      ) : null}
+
+                      {/* Live target preview */}
+                      {labWsSrcDims && labWsOptions.aspect !== 'custom' ? (
+                        (() => {
+                          const aspectMap: Record<string, [number, number]> = {
+                            'square': [1, 1], '4:3': [4, 3], '3:2': [3, 2],
+                            '16:9': [16, 9], '9:16': [9, 16], '3:4': [3, 4], '2:3': [2, 3]
+                          };
+                          const aspect = String(labWsOptions.aspect ?? 'square');
+                          const ratio = aspectMap[aspect];
+                          if (!ratio) return null;
+                          const [rw, rh] = ratio;
+                          // Find max crop that fits inside source
+                          const srcAspect = labWsSrcDims.w / labWsSrcDims.h;
+                          const tgtAspect = rw / rh;
+                          let cropW: number, cropH: number;
+                          if (tgtAspect > srcAspect) {
+                            cropW = labWsSrcDims.w;
+                            cropH = Math.round(labWsSrcDims.w / tgtAspect);
+                          } else {
+                            cropH = labWsSrcDims.h;
+                            cropW = Math.round(labWsSrcDims.h * tgtAspect);
+                          }
+                          return (
+                            <div className="forge-labws-crop-preview">
+                              <div className="forge-labws-crop-preview-row">
+                                <span><small>Source</small><strong>{labWsSrcDims.w} × {labWsSrcDims.h}</strong></span>
+                                <ArrowRight size={13} />
+                                <span><small>Crop</small><strong>{cropW} × {cropH}</strong></span>
+                              </div>
+                              <small>Tự động chọn vùng lớn nhất giữ đúng tỉ lệ</small>
+                            </div>
+                          );
+                        })()
+                      ) : null}
+
+                      <div className="forge-labws-field" style={{ marginTop: 10 }}>
+                        <label>
+                          Lưới rule-of-thirds
+                          <button
+                            type="button"
+                            className={`forge-labws-toggle ${labWsShowGrid ? 'on' : ''}`}
+                            onClick={() => setLabWsShowGrid(!labWsShowGrid)}
+                          >
+                            {labWsShowGrid ? 'ON' : 'OFF'}
+                          </button>
+                        </label>
+                        <small>Overlay lưới 3×3 lên canvas để bố cục cân đối</small>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {toolId === 'scan-document' ? (
+                    <div className="forge-labws-section">
+                      <div className="forge-labws-section-title">Pipeline xử lý</div>
+                      <ol className="forge-labws-pipeline">
+                        <li><span>1</span><div><strong>Auto-rotate</strong><small>Theo EXIF orientation</small></div></li>
+                        <li><span>2</span><div><strong>Grayscale</strong><small>Chuyển ảnh sang đen trắng</small></div></li>
+                        <li><span>3</span><div><strong>CLAHE contrast</strong><small>Tăng tương phản adaptive</small></div></li>
+                        <li><span>4</span><div><strong>Unsharp mask</strong><small>Sharpen ranh giới chữ</small></div></li>
+                        <li><span>5</span><div><strong>Export PNG</strong><small>Lossless, sẵn cho OCR</small></div></li>
+                      </ol>
+                      <div className="forge-labws-help">
+                        <Sparkles size={11} /> Tự động — không có options. Chỉ cần upload ảnh chụp giấy là chạy.
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {toolId === 'remove-object' ? (
+                    <>
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Chế độ xoá</div>
+                        <div className="forge-inpaint-modes">
+                          <button
+                            type="button"
+                            className={`forge-inpaint-mode ${labInpaintMode === 'smart' ? 'active' : ''}`}
+                            onClick={() => setLabInpaintMode('smart')}
+                          >
+                            <div className="forge-inpaint-mode-icon"><Layers size={16} /></div>
+                            <div>
+                              <strong>Thông minh (AI) <em className="forge-inpaint-mode-warn" style={{ background: 'rgba(4,120,87,.15)', color: '#047857' }}>Samsung-style</em></strong>
+                              <small>Giữ chủ thể chính, tự phát hiện + xoá vật thể phụ (người, xe, đồ nền). Chọn được từng vật thể.</small>
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            className={`forge-inpaint-mode ${labInpaintMode === 'manual' ? 'active' : ''}`}
+                            onClick={() => { setLabInpaintMode('manual'); setLabInpaintAutoMask(''); }}
+                          >
+                            <div className="forge-inpaint-mode-icon"><Wand2 size={16} /></div>
+                            <div>
+                              <strong>Thủ công (Brush)</strong>
+                              <small>Vẽ vùng cần xoá bằng cọ — chính xác tuyệt đối cho mọi vật thể.</small>
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            className={`forge-inpaint-mode ${labInpaintMode === 'subject' ? 'active' : ''} ${!health?.rembgReady ? 'is-disabled' : ''}`}
+                            onClick={() => { if (health?.rembgReady) { setLabInpaintMode('subject'); } }}
+                            disabled={!health?.rembgReady}
+                          >
+                            <div className="forge-inpaint-mode-icon"><Eraser size={16} /></div>
+                            <div>
+                              <strong>Xoá chủ thể chính {!health?.rembgReady ? <em className="forge-inpaint-mode-warn">cần rembg</em> : null}</strong>
+                              <small>Ngược lại: xoá nhân vật chính, giữ background. Hợp ảnh sản phẩm.</small>
+                            </div>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* SMART mode — YOLO object detection */}
+                      {labInpaintMode === 'smart' ? (
+                        <div className="forge-labws-section">
+                          <div className="forge-labws-section-title">Phát hiện vật thể (YOLOv8)</div>
+                          <button
+                            type="button"
+                            className="forge-inpaint-detect-btn"
+                            onClick={detectInpaintObjects}
+                            disabled={!labWsFile || labDetectBusy}
+                          >
+                            {labDetectBusy ? (
+                              <><Loader2 size={14} className="forge-labws-spin" /> Đang quét vật thể…</>
+                            ) : labDetectResult ? (
+                              <><CheckCircle2 size={14} /> Quét lại</>
+                            ) : (
+                              <><Layers size={14} /> Quét vật thể trong ảnh</>
+                            )}
+                          </button>
+
+                          {labDetectResult && labDetectResult.objects.length > 0 ? (
+                            <div className="forge-obj-list">
+                              <div className="forge-obj-list-head">
+                                <span>{labDetectResult.objects.length} vật thể · chọn cái cần xoá</span>
+                                <div className="forge-obj-list-actions">
+                                  <button type="button" onClick={() => setLabRemoveIds(new Set(labDetectResult.objects.filter((o) => !o.isMain).map((o) => o.id)))}>Chỉ phụ</button>
+                                  <button type="button" onClick={() => setLabRemoveIds(new Set(labDetectResult.objects.map((o) => o.id)))}>Tất cả</button>
+                                  <button type="button" onClick={() => setLabRemoveIds(new Set())}>Bỏ chọn</button>
+                                </div>
+                              </div>
+                              {labDetectResult.objects.map((obj) => {
+                                const removing = labRemoveIds.has(obj.id);
+                                return (
+                                  <button
+                                    key={obj.id}
+                                    type="button"
+                                    className={`forge-obj-item ${removing ? 'removing' : 'keeping'}`}
+                                    onClick={() => toggleRemoveObject(obj.id)}
+                                    onMouseEnter={() => setLabHoverObjId(obj.id)}
+                                    onMouseLeave={() => setLabHoverObjId(null)}
+                                  >
+                                    <span className="forge-obj-check">
+                                      {removing ? <Trash2 size={13} /> : <CheckCircle2 size={13} />}
+                                    </span>
+                                    <span className="forge-obj-info">
+                                      <strong>{obj.labelVi}{obj.isMain ? <em className="forge-obj-main">CHỦ THỂ</em> : null}</strong>
+                                      <small>{Math.round(obj.confidence * 100)}% · {obj.areaPct}% diện tích</small>
+                                    </span>
+                                    <span className="forge-obj-status">{removing ? 'XOÁ' : 'GIỮ'}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : labDetectResult ? (
+                            <div className="forge-labws-help warn">
+                              <AlertTriangle size={11} /> Không phát hiện vật thể rõ ràng. Thử <strong>Manual brush</strong> vẽ tay.
+                            </div>
+                          ) : (
+                            <div className="forge-labws-help">
+                              <Sparkles size={11} /> Bấm "Quét vật thể" — AI sẽ tìm tất cả người/xe/đồ vật, tự giữ chủ thể chính (xanh) và đánh dấu vật thể phụ để xoá (đỏ). Bạn tích chọn cái nào cần xoá.
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
+
+                      {/* SUBJECT mode — rembg remove main */}
+                      {labInpaintMode === 'subject' ? (
+                        <div className="forge-labws-section">
+                          <div className="forge-labws-section-title">Xoá chủ thể chính (rembg)</div>
+                          <button
+                            type="button"
+                            className="forge-inpaint-detect-btn"
+                            onClick={detectInpaintSubject}
+                            disabled={!labWsFile || labInpaintAutoBusy}
+                          >
+                            {labInpaintAutoBusy ? (
+                              <><Loader2 size={14} className="forge-labws-spin" /> Đang phát hiện…</>
+                            ) : labInpaintAutoMask ? (
+                              <><CheckCircle2 size={14} /> Đã phát hiện · phát hiện lại</>
+                            ) : (
+                              <><Sparkles size={14} /> Phát hiện chủ thể</>
+                            )}
+                          </button>
+                          <div className="forge-labws-help">
+                            {labInpaintAutoMask
+                              ? <><CheckCircle2 size={11} /> Vùng đỏ glow = chủ thể sẽ bị xoá. Bấm "Xoá vật thể".</>
+                              : <><AlertTriangle size={11} /> Mode này xoá NHÂN VẬT CHÍNH (ngược với Thông minh). Hợp ảnh sản phẩm cần xoá người mẫu giữ phông.</>}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* MANUAL mode — brush */}
+                      {labInpaintMode === 'manual' ? (
+                        <div className="forge-labws-section">
+                          <div className="forge-labws-section-title">Brush Tool</div>
+                          <div className="forge-inpaint-tools">
+                            <button type="button" className={`forge-inpaint-tool ${labInpaintTool === 'brush' ? 'active' : ''}`} onClick={() => setLabInpaintTool('brush')}>
+                              <Palette size={13} /> Brush
+                            </button>
+                            <button type="button" className={`forge-inpaint-tool ${labInpaintTool === 'eraser' ? 'active' : ''}`} onClick={() => setLabInpaintTool('eraser')}>
+                              <Eraser size={13} /> Eraser
+                            </button>
+                            <button type="button" className="forge-inpaint-tool danger" onClick={clearInpaintMask} disabled={!labInpaintHasStrokes}>
+                              <Trash2 size={13} /> Clear
+                            </button>
+                          </div>
+                          <div className="forge-labws-field">
+                            <label>Kích thước cọ <em>{labInpaintBrushSize}</em></label>
+                            <input type="range" min={10} max={100} value={labInpaintBrushSize} onChange={(e) => setLabInpaintBrushSize(Number(e.target.value))} />
+                            <div className="forge-inpaint-brush-preview">
+                              <span style={{ width: `${labInpaintBrushSize}px`, height: `${labInpaintBrushSize}px` }} />
+                            </div>
+                          </div>
+                          <div className="forge-labws-help">
+                            <Sparkles size={11} /> Bôi cọ đỏ lên vật thể cần xoá. Eraser để sửa. Vẽ sát object → fill tự nhiên nhất.
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* SHARED engine + sliders */}
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-field">
+                          <label>Engine inpaint <small style={{ marginLeft: 'auto', color: '#94A3B8', fontWeight: 500, fontSize: 10.5 }}>auto chọn tốt nhất</small></label>
+                          <div className="forge-inpaint-engines">
+                            {[
+                              { id: 'auto', label: 'Auto (LaMa)', sub: 'Sắc nét · giữ background · khuyên dùng', tier: 'best', time: '~10-30s' },
+                              { id: 'ldm', label: 'AI LDM', sub: 'Generative · vùng lớn phức tạp', tier: 'best', time: '~40-90s' },
+                              { id: 'lama', label: 'AI LaMa', sub: 'Deep learning · background', tier: 'high', time: '~10-30s' },
+                              { id: 'telea', label: 'Telea', sub: 'cv2 · cực nhanh', tier: 'mid', time: '~2-3s' },
+                              { id: 'ns', label: 'Navier-Stokes', sub: 'cv2 · mịn', tier: 'mid', time: '~2-3s' }
+                            ].map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                className={`forge-inpaint-engine tier-${m.tier} ${(labWsOptions.method ?? 'auto') === m.id ? 'active' : ''}`}
+                                onClick={() => setLabWsOption('method', m.id)}
+                              >
+                                <div className="forge-inpaint-engine-head">
+                                  <strong>{m.label}</strong>
+                                  <span className={`forge-inpaint-engine-tier ${m.tier}`}>{m.tier === 'best' ? '★★★' : m.tier === 'high' ? '★★' : '★'}</span>
+                                </div>
+                                <small>{m.sub}</small>
+                                <em>{m.time}</em>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="forge-labws-field">
+                          <label>Mở rộng mask (dilate) <em>{labWsOptions.dilate ?? 12}px</em></label>
+                          <input type="range" min={0} max={40} value={Number(labWsOptions.dilate ?? 12)} onChange={(e) => setLabWsOption('dilate', Number(e.target.value))} />
+                          <small>Khuyên dùng 8–14px để ăn cả viền, bóng đổ và phần phản chiếu sát vật thể.</small>
+                        </div>
+                        <div className="forge-labws-field">
+                          <label>Mềm mép (feather) <em>{labWsOptions.feather ?? 3}px</em></label>
+                          <input type="range" min={0} max={40} value={Number(labWsOptions.feather ?? 3)} onChange={(e) => setLabWsOption('feather', Number(e.target.value))} />
+                          <small>4–8px thường tự nhiên nhất; quá cao sẽ làm vùng vá bị mờ.</small>
+                        </div>
+                        <div className="forge-labws-section-title">Hậu kỳ chống vết</div>
+                        <div className="forge-inpaint-method forge-inpaint-method-3">
+                          {[
+                            { key: 'removeShadow', label: 'Xóa bóng đổ', sub: 'Ăn thêm vùng tối bất thường quanh mask' },
+                            { key: 'removeReflection', label: 'Xóa phản chiếu', sub: 'Ăn thêm glare/highlight trắng sát vật thể' },
+                            { key: 'premium', label: 'Hậu kỳ cao cấp', sub: 'Match màu, grain, sharpness và diệt halo viền' }
+                          ].map((item) => {
+                            const active = String(labWsOptions[item.key] ?? 'true') !== 'false';
+                            return (
+                              <button
+                                key={item.key}
+                                type="button"
+                                className={active ? 'active' : ''}
+                                onClick={() => setLabWsOption(item.key, active ? 'false' : 'true')}
+                              >
+                                <strong>{item.label}</strong>
+                                <small>{item.sub}</small>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {((labWsOptions.method ?? 'auto') === 'ldm') ? (
+                          <div className="forge-labws-field">
+                            <label>LDM steps <em>{labWsOptions.ldmSteps ?? 35}</em></label>
+                            <input type="range" min={10} max={50} value={Number(labWsOptions.ldmSteps ?? 35)} onChange={(e) => setLabWsOption('ldmSteps', Number(e.target.value))} />
+                            <small>25 = cân bằng. 40+ = chất lượng cao hơn, chậm hơn.</small>
+                          </div>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
+
+                  {toolId === 'strip-metadata' ? (
+                    <>
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Privacy Audit</div>
+                        <div className="forge-labws-privacy">
+                          <div className="forge-labws-privacy-score">
+                            <div className="forge-labws-privacy-score-num">!</div>
+                            <div>
+                              <strong>Ảnh chưa được làm sạch</strong>
+                              <small>{labWsFile ? 'Có thể chứa metadata nhạy cảm' : 'Upload ảnh để bắt đầu'}</small>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="forge-labws-section">
+                        <div className="forge-labws-section-title">Metadata sẽ bị xoá</div>
+                        <div className="forge-labws-meta-grid">
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>📍 GPS Location</strong>
+                              <span className="forge-labws-meta-pill danger">Cao</span>
+                            </div>
+                            <small>Toạ độ chính xác lúc chụp · có thể lộ nhà / nơi làm việc</small>
+                          </div>
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>📷 Camera Info</strong>
+                              <span className="forge-labws-meta-pill warn">Trung</span>
+                            </div>
+                            <small>Model máy, ống kính, ISO, aperture, focal length</small>
+                          </div>
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>🕐 Timestamp</strong>
+                              <span className="forge-labws-meta-pill warn">Trung</span>
+                            </div>
+                            <small>Ngày giờ chụp · ngày sửa · timezone</small>
+                          </div>
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>👤 Author / Copyright</strong>
+                              <span className="forge-labws-meta-pill ok">Thấp</span>
+                            </div>
+                            <small>Tên tác giả · phần mềm chỉnh sửa · copyright</small>
+                          </div>
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>🎨 Color Profile</strong>
+                              <span className="forge-labws-meta-pill ok">Thấp</span>
+                            </div>
+                            <small>ICC profile, color space — giữ lại nếu cần in</small>
+                          </div>
+                          <div className="forge-labws-meta-item ok">
+                            <div className="forge-labws-meta-head">
+                              <strong>🏷️ Tags / Keywords</strong>
+                              <span className="forge-labws-meta-pill ok">Thấp</span>
+                            </div>
+                            <small>IPTC tags, keywords, captions nhúng trong file</small>
+                          </div>
+                        </div>
+                        <div className="forge-labws-help">
+                          <ShieldCheck size={11} /> Pixel ảnh giữ nguyên 100% — chỉ xoá EXIF/IPTC/XMP container. An toàn cho mọi mạng xã hội.
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {/* Generic process panel */}
+                  <div className="forge-labws-section">
+                    {labWsError ? (
+                      <div className="forge-labws-error">
+                        <AlertTriangle size={13} /> {labWsError}
+                      </div>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="forge-labws-process"
+                      disabled={
+                        !canProcess ||
+                        (toolId === 'remove-object' && labInpaintMode === 'smart' && labRemoveIds.size === 0) ||
+                        (toolId === 'remove-object' && labInpaintMode === 'subject' && !labInpaintAutoMask) ||
+                        (toolId === 'remove-object' && labInpaintMode === 'manual' && !labInpaintHasStrokes)
+                      }
+                      onClick={toolId === 'remove-object' ? runInpaintWorkspace : runLabWorkspace}
+                    >
+                      {labWsBusy ? (
+                        <><Loader2 size={15} className="forge-labws-spin" /> {toolId === 'remove-object' ? 'Đang xoá vật thể…' : 'Đang xử lý…'}</>
+                      ) : hasResult ? (
+                        <><Wand2 size={15} /> {toolId === 'remove-object' ? 'Xoá lại' : 'Xử lý lại'}</>
+                      ) : toolId === 'remove-object' ? (
+                        labInpaintMode === 'smart' && labRemoveIds.size === 0 ? (
+                          <><Layers size={15} /> {labDetectResult ? 'Chọn vật thể cần xoá' : 'Quét vật thể trước'}</>
+                        ) : labInpaintMode === 'subject' && !labInpaintAutoMask ? (
+                          <><Sparkles size={15} /> Cần phát hiện chủ thể trước</>
+                        ) : labInpaintMode === 'manual' && !labInpaintHasStrokes ? (
+                          <><Sparkles size={15} /> Cần vẽ vùng cần xoá</>
+                        ) : (
+                          <><Wand2 size={15} /> {labInpaintMode === 'smart' ? `Xoá ${labRemoveIds.size} vật thể` : 'Xoá vật thể'}</>
+                        )
+                      ) : (
+                        <><Wand2 size={15} /> {!labWsFile ? 'Cần upload ảnh' : `Chạy ${card.title}`}</>
+                      )}
+                    </button>
+                    {hasResult ? (
+                      <div className="forge-labws-result-actions">
+                        <a className="forge-labws-download" href={labWsResult.downloadUrl} download={labWsResult.fileName}>
+                          <Download size={14} /> Tải {labWsResult.fileName}
+                          <em>{formatBytes(labWsResult.size)}</em>
+                        </a>
+                        <button type="button" className="forge-labws-reset" onClick={() => { resetLabWorkspace(); }}>
+                          <UploadCloud size={12} /> Ảnh mới
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {/* Tips */}
+                  {card.tips.length > 0 ? (
+                    <div className="forge-labws-section">
+                      <div className="forge-labws-section-title"><Sparkles size={11} /> Tips</div>
+                      <ul className="forge-labws-tips">
+                        {card.tips.slice(0, 3).map((tip, i) => (
+                          <li key={i}><CheckCircle2 size={11} /> {tip}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </aside>
+              </div>
+            </section>
+          );
+        })()
+      ) : activeTool === 'lab' ? (
+        (() => {
+          const labCounts = {
+            all: aiLabCards.length,
+            image: aiLabCards.filter((c) => c.category === 'image').length,
+            audio: aiLabCards.filter((c) => c.category === 'audio').length,
+            document: aiLabCards.filter((c) => c.category === 'document').length,
+            premium: aiLabCards.filter((c) => c.premium).length,
+            soon: aiLabCards.filter((c) => !c.available).length
+          };
+          const labFiltered = aiLabCards
+            .filter((c) => {
+              if (labCategory === 'premium' && !c.premium) return false;
+              if (labCategory === 'soon' && c.available) return false;
+              if (labCategory !== 'all' && labCategory !== 'premium' && labCategory !== 'soon' && c.category !== labCategory) return false;
+              if (labSearch.trim()) {
+                const q = labSearch.trim().toLowerCase();
+                const blob = `${c.title} ${c.description} ${c.tag} ${c.formats.join(' ')}`.toLowerCase();
+                if (!blob.includes(q)) return false;
+              }
+              return true;
+            })
+            .sort((a, b) => {
+              if (labSort === 'az') return a.title.localeCompare(b.title, 'vi');
+              if (labSort === 'new') return (a.available === b.available ? 0 : a.available ? 1 : -1);
+              // popular: available first, popular flag, then alphabetic
+              if (a.available !== b.available) return a.available ? -1 : 1;
+              if (!!a.popular !== !!b.popular) return a.popular ? -1 : 1;
+              return a.title.localeCompare(b.title, 'vi');
+            });
+          const recentCards = labRecentIds
+            .map((id) => aiLabCards.find((c) => c.id === id))
+            .filter((c): c is AILabCard => !!c);
+          const detail = labDetailId ? aiLabCards.find((c) => c.id === labDetailId) : null;
+          const renderPreview = (card: AILabCard) => (
+            card.preview === 'portrait' ? (
+              <div className="lp-portrait">
+                <div className="lp-portrait-head" />
+                <div className="lp-portrait-shoulder" />
+              </div>
+            ) : card.preview === 'landscape' ? (
+              <div className="lp-landscape">
+                <div className="lp-mountain mtn1" />
+                <div className="lp-mountain mtn2" />
+                <div className="lp-sun" />
+              </div>
+            ) : card.preview === 'vintage' ? (
+              <div className="lp-vintage">
+                <div className="lp-vintage-head" />
+                <div className="lp-vintage-shoulder" />
+              </div>
+            ) : card.preview === 'beach' ? (
+              <div className="lp-beach">
+                <div className="lp-beach-sky" />
+                <div className="lp-beach-sun" />
+                <div className="lp-palm">
+                  <span /><span /><span />
+                </div>
+              </div>
+            ) : card.preview === 'palette' ? (
+              <div className="lp-palette">
+                <span style={{ background: '#D1FAE5' }} />
+                <span style={{ background: '#A7F3D0' }} />
+                <span style={{ background: '#10B981' }} />
+                <span style={{ background: '#047857' }} />
+              </div>
+            ) : card.preview === 'crop' ? (
+              <div className="lp-crop">
+                <span className="lp-crop-corner tl" />
+                <span className="lp-crop-corner tr" />
+                <span className="lp-crop-corner bl" />
+                <span className="lp-crop-corner br" />
+                <span className="lp-crop-h" />
+                <span className="lp-crop-v" />
+              </div>
+            ) : card.preview === 'text' ? (
+              <div className="lp-text">
+                <div className="lp-text-quote">"Một bức ảnh chứa cảnh chuyển nghiệp với ánh nắng studio..."</div>
+              </div>
+            ) : card.preview === 'bilingual' ? (
+              <div className="lp-bilingual">
+                <div className="lp-line en">English text</div>
+                <div className="lp-line vi">Văn bản tiếng Việt</div>
+              </div>
+            ) : card.preview === 'audiobars' ? (
+              <div className="lp-audiobars">
+                {[35, 55, 80, 65, 95, 50, 40, 70, 45, 60, 30].map((h, i) => (
+                  <span key={i} style={{ height: `${h}%` }} />
+                ))}
+              </div>
+            ) : card.preview === 'voicewave' ? (
+              <div className="lp-voicewave">
+                <span className="lp-voicewave-play"><PlayCircle size={16} /></span>
+                <svg className="lp-voicewave-line" viewBox="0 0 120 24" preserveAspectRatio="none">
+                  <path d="M0 12 Q10 4 20 12 T40 12 T60 12 T80 12 T100 12 T120 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                </svg>
+              </div>
+            ) : (
+              <div className="lp-document">
+                <span /><span /><span />
+              </div>
+            )
+          );
+          const iconFor = (icon: AILabCard['icon']) =>
+            icon === 'eraser' ? Eraser :
+            icon === 'palette' ? Palette :
+            icon === 'zap' ? Zap :
+            icon === 'scan' ? ScanLine :
+            icon === 'languages' ? Languages :
+            icon === 'mic' ? Mic :
+            icon === 'wand' ? Wand2 :
+            icon === 'volume' ? Volume2 :
+            Image;
+          return (
+            <section className="forge-lab-section">
+              <div className="forge-lab-hero">
+                <span className="forge-lab-hero-eyebrow">PREMIUM SUITE</span>
+                <h1 className="forge-lab-hero-title">Thư viện công cụ AI</h1>
+                <p className="forge-lab-hero-sub">
+                  Khám phá bộ sưu tập các công cụ xử lý hình ảnh và âm thanh tiên tiến nhất. Tất cả chạy local — không upload, miễn phí, không giới hạn.
+                </p>
+                <div className="forge-lab-hero-meta">
+                  <span><Sparkles size={12} /> {labCounts.all} công cụ</span>
+                  <span><ShieldCheck size={12} /> 100% Local</span>
+                  <span><TrendingUp size={12} /> Free tier</span>
+                </div>
+              </div>
+
+              {/* Toolbar */}
+              <div className="forge-lab-toolbar">
+                <div className="forge-lab-search">
+                  <Search size={14} />
+                  <input
+                    type="search"
+                    placeholder="Tìm tool AI (vd: xoá nền, transcript, OCR…)"
+                    value={labSearch ?? ''}
+                    onChange={(e) => setLabSearch(e.target.value)}
+                  />
+                  {labSearch ? (
+                    <button type="button" className="forge-lab-search-clear" onClick={() => setLabSearch('')} aria-label="Clear">
+                      <XCircle size={13} />
+                    </button>
+                  ) : null}
+                </div>
+
+                <div className="forge-lab-cats" role="tablist" aria-label="Category">
+                  <button type="button" className={labCategory === 'all' ? 'active' : ''} onClick={() => setLabCategory('all')}>
+                    Tất cả <em>{labCounts.all}</em>
+                  </button>
+                  <button type="button" className={labCategory === 'image' ? 'active' : ''} onClick={() => setLabCategory('image')}>
+                    Ảnh <em>{labCounts.image}</em>
+                  </button>
+                  <button type="button" className={labCategory === 'audio' ? 'active' : ''} onClick={() => setLabCategory('audio')}>
+                    Audio <em>{labCounts.audio}</em>
+                  </button>
+                  <button type="button" className={labCategory === 'document' ? 'active' : ''} onClick={() => setLabCategory('document')}>
+                    Tài liệu <em>{labCounts.document}</em>
+                  </button>
+                  <button type="button" className={labCategory === 'premium' ? 'active' : ''} onClick={() => setLabCategory('premium')}>
+                    Premium <em>{labCounts.premium}</em>
+                  </button>
+                  <button type="button" className={labCategory === 'soon' ? 'active' : ''} onClick={() => setLabCategory('soon')}>
+                    Sắp ra <em>{labCounts.soon}</em>
+                  </button>
+                </div>
+
+                <div className="forge-lab-sort">
+                  <Filter size={13} />
+                  <select value={labSort} onChange={(e) => setLabSort(e.target.value as typeof labSort)}>
+                    <option value="popular">Phổ biến</option>
+                    <option value="az">A → Z</option>
+                    <option value="new">Mới ra</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Recently used (only when filter = all) */}
+              {recentCards.length > 0 && labCategory === 'all' && !labSearch ? (
+                <div className="forge-lab-recent">
+                  <div className="forge-lab-recent-head">
+                    <span><History size={13} /> Gần đây bạn đã dùng</span>
+                    <button type="button" className="forge-lab-recent-clear" onClick={() => { setLabRecentIds([]); try { localStorage.removeItem('convert-url:lab-recent-v1'); } catch { /* */ } }}>
+                      Xoá
+                    </button>
+                  </div>
+                  <div className="forge-lab-recent-row">
+                    {recentCards.map((card) => {
+                      const Icon = iconFor(card.icon);
+                      return (
+                        <button key={card.id} type="button" className={`forge-lab-recent-pill accent-${card.accent}`} onClick={() => openLabCard(card)}>
+                          <span className="forge-lab-recent-pill-icon"><Icon size={13} /></span>
+                          <span>{card.title}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Cards grid */}
+              {labFiltered.length === 0 ? (
+                <div className="forge-lab-empty">
+                  <Search size={32} />
+                  <strong>Không tìm thấy công cụ phù hợp</strong>
+                  <span>Thử bỏ bộ lọc hoặc tìm bằng từ khoá khác.</span>
+                  <button type="button" className="forge-button" onClick={() => { setLabSearch(''); setLabCategory('all'); }}>
+                    <XCircle size={13} /> Xoá bộ lọc
+                  </button>
+                </div>
+              ) : (
+                <div className="forge-lab-grid">
+                  {labFiltered.map((card) => {
+                    const Icon = iconFor(card.icon);
+                    const handleClick = () => openLabCard(card);
+                    return (
+                      <div
+                        key={card.id}
+                        className={`forge-lab-card accent-${card.accent} ${card.available ? '' : 'is-soon'}`}
+                        role="button"
+                        tabIndex={0}
+                        onClick={handleClick}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(); }}
+                        title={card.description}
+                      >
+                        {card.premium ? <span className="forge-lab-premium-badge">PREMIUM</span> : null}
+                        {card.popular && !card.premium ? <span className="forge-lab-popular-badge"><TrendingUp size={9} /> HOT</span> : null}
+                        <div className="forge-lab-card-top">
+                          <div className="forge-lab-card-icon"><Icon size={16} /></div>
+                          <button
+                            type="button"
+                            className="forge-lab-card-info"
+                            aria-label="Chi tiết"
+                            title="Xem chi tiết"
+                            onClick={(e) => { e.stopPropagation(); setLabDetailId(card.id); }}
+                          >
+                            <HelpCircle size={13} />
+                          </button>
+                        </div>
+                        <h3 className="forge-lab-card-title">{card.title}</h3>
+                        <div className={`forge-lab-preview preview-${card.preview}`} aria-hidden="true">
+                          {renderPreview(card)}
+                        </div>
+                        <div className="forge-lab-card-meta">
+                          <span className="forge-lab-card-meta-formats">
+                            {card.formats.slice(0, 3).map((f) => <em key={f}>{f}</em>)}
+                            {card.formats.length > 3 ? <em>+{card.formats.length - 3}</em> : null}
+                          </span>
+                          <span className="forge-lab-card-meta-time"><Clock size={10} /> {card.processTime}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="forge-lab-foot">
+                <div className="forge-lab-foot-stats">
+                  <div className="forge-lab-stat">
+                    <div className="forge-lab-stat-icon emerald"><Sparkles size={16} /></div>
+                    <div>
+                      <strong>{aiLabCards.filter((c) => c.available).length}</strong>
+                      <span>Sẵn sàng dùng</span>
+                    </div>
+                  </div>
+                  <div className="forge-lab-stat">
+                    <div className="forge-lab-stat-icon violet"><Wand2 size={16} /></div>
+                    <div>
+                      <strong>{aiLabCards.filter((c) => !c.available).length}</strong>
+                      <span>Đang phát triển</span>
+                    </div>
+                  </div>
+                  <div className="forge-lab-stat">
+                    <div className="forge-lab-stat-icon peach"><ShieldCheck size={16} /></div>
+                    <div>
+                      <strong>100%</strong>
+                      <span>Local · không upload</span>
+                    </div>
+                  </div>
+                  <div className="forge-lab-stat">
+                    <div className="forge-lab-stat-icon sky"><TrendingUp size={16} /></div>
+                    <div>
+                      <strong>Free</strong>
+                      <span>Không giới hạn</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="forge-lab-cta">
+                  <div>
+                    <strong>Cần một tính năng AI cụ thể?</strong>
+                    <span>Ý tưởng hay đều cân nhắc — đặc biệt nếu chạy được local không cần GPU lớn.</span>
+                  </div>
+                  <button type="button" className="forge-button" onClick={() => {
+                    setActiveTool('files');
+                    pushToast({ variant: 'info', title: 'Đã có 28 công cụ', detail: 'Khám phá File Tools' });
+                  }}>
+                    Xem 28 công cụ <ChevronRight size={14} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Detail Modal */}
+              {detail ? (
+                <>
+                  <div className="forge-lab-modal-backdrop" onClick={() => setLabDetailId(null)} />
+                  <div className="forge-lab-modal" role="dialog" aria-labelledby="lab-detail-title" aria-modal="true">
+                    <button type="button" className="forge-lab-modal-close" aria-label="Đóng" onClick={() => setLabDetailId(null)}>
+                      <XCircle size={16} />
+                    </button>
+                    <div className={`forge-lab-modal-head accent-${detail.accent}`}>
+                      <div className="forge-lab-modal-icon">
+                        {(() => { const Icon = iconFor(detail.icon); return <Icon size={22} />; })()}
+                      </div>
+                      <div className="forge-lab-modal-head-text">
+                        <div className="forge-lab-modal-tag">
+                          {detail.tag}
+                          {detail.premium ? <span className="forge-lab-modal-pill premium">PREMIUM</span> : null}
+                          {detail.popular ? <span className="forge-lab-modal-pill hot"><TrendingUp size={10} /> HOT</span> : null}
+                          {!detail.available ? <span className="forge-lab-modal-pill soon"><Clock size={10} /> {detail.comingSoon}</span> : null}
+                        </div>
+                        <h2 id="lab-detail-title">{detail.title}</h2>
+                        <p>{detail.description}</p>
+                      </div>
+                    </div>
+
+                    <div className="forge-lab-modal-body">
+                      {detail.longDescription ? (
+                        <p className="forge-lab-modal-long">{detail.longDescription}</p>
+                      ) : null}
+
+                      <div className="forge-lab-modal-stats">
+                        <div>
+                          <small>ĐỊNH DẠNG</small>
+                          <div className="forge-lab-modal-formats">
+                            {detail.formats.map((f) => <em key={f}>{f}</em>)}
+                          </div>
+                        </div>
+                        <div>
+                          <small>THỜI GIAN</small>
+                          <strong><Clock size={12} /> {detail.processTime}</strong>
+                        </div>
+                        <div>
+                          <small>GIỚI HẠN</small>
+                          <strong><Layers size={12} /> {detail.maxSize}</strong>
+                        </div>
+                      </div>
+
+                      {detail.tips.length > 0 ? (
+                        <div className="forge-lab-modal-tips">
+                          <div className="forge-lab-modal-section-title"><Sparkles size={12} /> Tips dùng tốt nhất</div>
+                          <ul>
+                            {detail.tips.map((tip, i) => <li key={i}><CheckCircle2 size={12} /> {tip}</li>)}
+                          </ul>
+                        </div>
+                      ) : null}
+
+                      {detail.relatedIds.length > 0 ? (
+                        <div className="forge-lab-modal-related">
+                          <div className="forge-lab-modal-section-title"><Workflow size={12} /> Có thể dùng kèm</div>
+                          <div className="forge-lab-modal-related-grid">
+                            {detail.relatedIds
+                              .map((id) => aiLabCards.find((c) => c.id === id))
+                              .filter((c): c is AILabCard => !!c)
+                              .map((c) => {
+                                const Icon = iconFor(c.icon);
+                                return (
+                                  <button key={c.id} type="button" className={`forge-lab-related accent-${c.accent}`} onClick={() => setLabDetailId(c.id)}>
+                                    <Icon size={13} />
+                                    <span>{c.title}</span>
+                                    <ChevronRight size={11} />
+                                  </button>
+                                );
+                              })}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="forge-lab-modal-foot">
+                      <button type="button" className="forge-lab-modal-cancel" onClick={() => setLabDetailId(null)}>
+                        Đóng
+                      </button>
+                      {detail.available ? (
+                        <button type="button" className="forge-lab-modal-primary" onClick={() => { setLabDetailId(null); openLabCard(detail); }}>
+                          {detail.action?.label ?? 'Mở công cụ'} <ArrowRight size={13} />
+                        </button>
+                      ) : (
+                        <button type="button" className="forge-lab-modal-primary disabled" disabled>
+                          <Clock size={13} /> {detail.comingSoon ?? 'Sắp ra'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </>
+              ) : null}
+            </section>
+          );
+        })()
+
       ) : activeTool === 'workflows' ? (
         <section className="forge-workflows-section">
           <div className="forge-media-hero" style={{ marginBottom: 32 }}>
@@ -2875,113 +6325,262 @@ export function App() {
           </div>
         </section>
       ) : activeTool === 'library' ? (
-        <section className="forge-library-section">
-          <div className="forge-media-hero" style={{ marginBottom: 32 }}>
-            <span className="forge-eyebrow"><Archive size={12} /> Library</span>
-            <h1 className="forge-h1">
-              Lịch sử <em>conversion</em> — mở lại bất cứ lúc nào
-            </h1>
-            <p className="forge-subhead">
-              Tất cả file đã chuyển đổi gần đây được lưu cục bộ trong trình duyệt. Click để mở lại job với đúng tool và file kết quả.
-            </p>
-          </div>
-
-          <div className="forge-lib-stats">
-            <div className="forge-lib-stat">
-              <div className="forge-lib-stat-icon emerald"><Archive size={20} /></div>
-              <div>
-                <strong>{recentEntries.length}</strong>
-                <span>Job đã lưu</span>
-              </div>
-            </div>
-            <div className="forge-lib-stat">
-              <div className="forge-lib-stat-icon peach"><FileText size={20} /></div>
-              <div>
-                <strong>{recentEntries.reduce((sum, e) => sum + e.files.length, 0)}</strong>
-                <span>File kết quả</span>
-              </div>
-            </div>
-            <div className="forge-lib-stat">
-              <div className="forge-lib-stat-icon violet"><Layers size={20} /></div>
-              <div>
-                <strong>{new Set(recentEntries.map((e) => e.tool)).size}</strong>
-                <span>Loại tool đã dùng</span>
-              </div>
-            </div>
-            <div className="forge-lib-stat">
-              <div className="forge-lib-stat-icon sky"><Clock size={20} /></div>
-              <div>
-                <strong>{recentEntries[0] ? relativeTime(recentEntries[0].createdAt) : '—'}</strong>
-                <span>Job mới nhất</span>
-              </div>
-            </div>
-          </div>
-
-          {recentEntries.length === 0 ? (
-            <div className="forge-lib-empty">
-              <Archive size={42} />
-              <h3>Chưa có lịch sử</h3>
-              <p>Sau khi chuyển đổi file ở tab <strong>File Tools</strong>, job sẽ tự lưu vào đây để bạn mở lại nhanh.</p>
-              <button type="button" className="forge-button" onClick={() => setActiveTool('files')}>
-                <FileSpreadsheet size={14} /> Mở File Tools
-              </button>
-            </div>
-          ) : (
-            <>
-              <div className="forge-lib-bar">
-                <div className="forge-lib-bar-meta">
-                  <Filter size={13} /> Hiện {recentEntries.length} job · lưu cục bộ trong trình duyệt
+        (() => {
+          function kindOf(entry: RecentEntry): 'image' | 'doc' | 'audio' {
+            const t = entry.tool.toLowerCase();
+            if (t.includes('image') || t.includes('photo') || t.includes('thumbnail') || t.includes('crop') || t.includes('chroma') || t.includes('background') || t.includes('scan') || t.includes('upscale') || t.includes('rotate') || t.includes('filter') || t.includes('metadata') || t.includes('compress') || t.includes('resize')) return 'image';
+            if (t.includes('audio') || t.includes('mp3') || t.includes('whisper') || t.includes('voice')) return 'audio';
+            return 'doc';
+          }
+          function colorTag(kind: 'image' | 'doc' | 'audio'): string {
+            return kind === 'image' ? 'AI IMAGE' : kind === 'audio' ? 'AUDIO' : 'TÀI LIỆU';
+          }
+          const allTools = Array.from(new Set(recentEntries.map((e) => e.toolTitle))).sort();
+          const filtered = recentEntries.filter((entry) => {
+            if (libTab === 'shared' || libTab === 'presets') return false;
+            const k = kindOf(entry);
+            if (libKind !== 'all' && libKind !== k) return false;
+            if (libTools.size > 0 && !libTools.has(entry.toolTitle)) return false;
+            if (libRange !== 'all') {
+              const now = Date.now();
+              const span = libRange === 'today' ? 86400000 : libRange === '7d' ? 7 * 86400000 : 30 * 86400000;
+              if (now - entry.createdAt > span) return false;
+            }
+            if (libSearch.trim()) {
+              const q = libSearch.trim().toLowerCase();
+              const blob = `${entry.toolTitle} ${entry.inputs.join(' ')} ${entry.files.map((f) => f.fileName).join(' ')}`.toLowerCase();
+              if (!blob.includes(q)) return false;
+            }
+            return true;
+          });
+          const totalSize = recentEntries.reduce((sum, e) => sum + e.files.reduce((s, f) => s + (f.size || 0), 0), 0);
+          return (
+            <section className="forge-library-v2">
+              <header className="forge-libv2-top">
+                <div className="forge-libv2-search">
+                  <Search size={14} />
+                  <input
+                    type="search"
+                    placeholder="Tìm kiếm tài liệu..."
+                    value={libSearch ?? ''}
+                    onChange={(e) => setLibSearch(e.target.value)}
+                  />
                 </div>
-                <button type="button" className="forge-lib-clear" onClick={clearRecent}>
-                  <Trash2 size={13} /> Xoá toàn bộ lịch sử
-                </button>
-              </div>
+                <nav className="forge-libv2-tabs" aria-label="Library tabs">
+                  <button type="button" className={libTab === 'recent' ? 'active' : ''} onClick={() => setLibTab('recent')}>Gần đây</button>
+                  <button type="button" className={libTab === 'shared' ? 'active' : ''} onClick={() => setLibTab('shared')}>Đã chia sẻ</button>
+                  <button type="button" className={libTab === 'presets' ? 'active' : ''} onClick={() => setLibTab('presets')}>Cấu hình sẵn</button>
+                </nav>
+              </header>
 
-              <div className="forge-lib-grid">
-                {recentEntries.map((entry) => (
-                  <div key={entry.jobId} className="forge-lib-card">
-                    <div className="forge-lib-card-head">
-                      <div className="forge-lib-card-tool">
-                        <Wand2 size={13} /> {entry.toolTitle}
+              <div className="forge-libv2-body">
+                <aside className="forge-libv2-filters">
+                  <div className="forge-libv2-filter-title">Bộ lọc</div>
+
+                  <div className="forge-libv2-filter">
+                    <label>KHOẢNG THỜI GIAN</label>
+                    <select value={libRange} onChange={(e) => setLibRange(e.target.value as typeof libRange)}>
+                      <option value="all">Tất cả thời gian</option>
+                      <option value="today">Hôm nay</option>
+                      <option value="7d">7 ngày qua</option>
+                      <option value="30d">30 ngày qua</option>
+                    </select>
+                  </div>
+
+                  <div className="forge-libv2-filter">
+                    <label>LOẠI TỆP</label>
+                    <div className="forge-libv2-pills">
+                      <button type="button" className={libKind === 'all' ? 'active' : ''} onClick={() => setLibKind('all')}>Tất cả</button>
+                      <button type="button" className={libKind === 'image' ? 'active' : ''} onClick={() => setLibKind('image')}>Ảnh</button>
+                      <button type="button" className={libKind === 'doc' ? 'active' : ''} onClick={() => setLibKind('doc')}>Tài liệu</button>
+                      <button type="button" className={libKind === 'audio' ? 'active' : ''} onClick={() => setLibKind('audio')}>Audio</button>
+                    </div>
+                  </div>
+
+                  <div className="forge-libv2-filter">
+                    <label>CÔNG CỤ ĐÃ DÙNG</label>
+                    <div className="forge-libv2-checks">
+                      {allTools.length === 0 ? (
+                        <small className="forge-libv2-checks-empty">Chưa có job nào</small>
+                      ) : (
+                        allTools.slice(0, 8).map((tool) => (
+                          <label key={tool} className="forge-libv2-check">
+                            <input
+                              type="checkbox"
+                              checked={libTools.has(tool)}
+                              onChange={() => {
+                                setLibTools((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(tool)) next.delete(tool); else next.add(tool);
+                                  return next;
+                                });
+                              }}
+                            />
+                            <span>{tool}</span>
+                          </label>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {(libKind !== 'all' || libTools.size > 0 || libRange !== 'all' || libSearch) ? (
+                    <button
+                      type="button"
+                      className="forge-libv2-reset"
+                      onClick={() => { setLibKind('all'); setLibTools(new Set()); setLibRange('all'); setLibSearch(''); }}
+                    >
+                      <XCircle size={12} /> Xoá bộ lọc
+                    </button>
+                  ) : null}
+
+                  <div className="forge-libv2-mini-stats">
+                    <div>
+                      <strong>{recentEntries.length}</strong>
+                      <small>Job đã lưu</small>
+                    </div>
+                    <div>
+                      <strong>{recentEntries.reduce((sum, e) => sum + e.files.length, 0)}</strong>
+                      <small>File kết quả</small>
+                    </div>
+                    <div>
+                      <strong>{(totalSize / 1024 / 1024).toFixed(1)} MB</strong>
+                      <small>Dung lượng</small>
+                    </div>
+                  </div>
+                </aside>
+
+                <main className="forge-libv2-main">
+                  <div className="forge-libv2-mainhead">
+                    <div>
+                      <h1 className="forge-libv2-h1">Thư viện của bạn</h1>
+                      <p className="forge-libv2-sub">Quản lý {recentEntries.length.toLocaleString('vi-VN')} tài sản đã được AI xử lý</p>
+                    </div>
+                    <div className="forge-libv2-actions">
+                      {recentEntries.length > 0 ? (
+                        <button type="button" className="forge-libv2-clear" onClick={clearRecent} title="Xoá toàn bộ">
+                          <Trash2 size={13} /> Xoá tất cả
+                        </button>
+                      ) : null}
+                      <div className="forge-libv2-viewtoggle" role="tablist" aria-label="View mode">
+                        <button type="button" className={libView === 'grid' ? 'active' : ''} onClick={() => setLibView('grid')} aria-label="Grid">
+                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="1" width="5" height="5" rx="1" fill="currentColor"/><rect x="8" y="1" width="5" height="5" rx="1" fill="currentColor"/><rect x="1" y="8" width="5" height="5" rx="1" fill="currentColor"/><rect x="8" y="8" width="5" height="5" rx="1" fill="currentColor"/></svg>
+                        </button>
+                        <button type="button" className={libView === 'list' ? 'active' : ''} onClick={() => setLibView('list')} aria-label="List">
+                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="2" width="12" height="2" rx="1" fill="currentColor"/><rect x="1" y="6" width="12" height="2" rx="1" fill="currentColor"/><rect x="1" y="10" width="12" height="2" rx="1" fill="currentColor"/></svg>
+                        </button>
                       </div>
-                      <button
-                        type="button"
-                        className="forge-lib-card-del"
-                        onClick={(e) => { e.stopPropagation(); deleteRecent(entry.jobId); }}
-                        aria-label="Xoá job"
-                        title="Xoá khỏi lịch sử"
-                      >
-                        <Trash2 size={12} />
+                    </div>
+                  </div>
+
+                  {libTab === 'shared' ? (
+                    <div className="forge-libv2-empty">
+                      <Layers size={36} />
+                      <strong>Chưa có tài liệu đã chia sẻ</strong>
+                      <span>Tính năng share link đang được phát triển. Sắp có trong bản tới.</span>
+                    </div>
+                  ) : libTab === 'presets' ? (
+                    <div className="forge-libv2-empty">
+                      <Workflow size={36} />
+                      <strong>Quản lý preset</strong>
+                      <span>Lưu cấu hình tool yêu thích để dùng lại nhanh — sắp ra mắt.</span>
+                    </div>
+                  ) : recentEntries.length === 0 ? (
+                    <div className="forge-libv2-empty">
+                      <Archive size={36} />
+                      <strong>Chưa có lịch sử</strong>
+                      <span>Sau khi chuyển đổi file ở File Tools, job sẽ tự lưu vào đây.</span>
+                      <button type="button" className="forge-button" onClick={() => setActiveTool('files')}>
+                        <FileSpreadsheet size={13} /> Mở File Tools
                       </button>
                     </div>
-                    <div className="forge-lib-card-meta">
-                      <Clock size={11} /> {relativeTime(entry.createdAt)}
-                      <span className="forge-lib-card-sep">·</span>
-                      <FileText size={11} /> {entry.files.length} file
+                  ) : filtered.length === 0 ? (
+                    <div className="forge-libv2-empty">
+                      <Search size={36} />
+                      <strong>Không có kết quả</strong>
+                      <span>Thử bỏ bớt bộ lọc hoặc tìm với từ khoá khác.</span>
                     </div>
-                    {entry.inputs.length > 0 ? (
-                      <div className="forge-lib-card-input" title={entry.inputs.join(', ')}>
-                        {entry.inputs[0]}
-                        {entry.inputs.length > 1 ? <em> +{entry.inputs.length - 1}</em> : null}
-                      </div>
-                    ) : null}
-                    <div className="forge-lib-card-files">
-                      {entry.files.slice(0, 3).map((file) => (
-                        <a key={file.downloadUrl} className="forge-lib-card-file" href={file.downloadUrl} download={file.fileName} title={file.fileName} onClick={(e) => e.stopPropagation()}>
-                          <Download size={11} /> {file.fileName}
-                        </a>
-                      ))}
-                      {entry.files.length > 3 ? <span className="forge-lib-card-more">+{entry.files.length - 3} file khác</span> : null}
+                  ) : libView === 'grid' ? (
+                    <div className="forge-libv2-grid">
+                      {filtered.map((entry) => {
+                        const k = kindOf(entry);
+                        const firstName = entry.files[0]?.fileName || entry.toolTitle;
+                        const shortName = firstName.length > 16 ? firstName.slice(0, 14) + '…' : firstName;
+                        const dateStr = new Date(entry.createdAt).toLocaleDateString('vi-VN').replaceAll('/', '.');
+                        return (
+                          <button
+                            key={entry.jobId}
+                            type="button"
+                            className={`forge-libv2-card kind-${k}`}
+                            onClick={() => applyRecent(entry)}
+                            title={`${entry.toolTitle} · ${relativeTime(entry.createdAt)}`}
+                          >
+                            <div className="forge-libv2-thumb">
+                              {k === 'image' ? (
+                                <div className="lp-portrait small">
+                                  <div className="lp-portrait-head" />
+                                  <div className="lp-portrait-shoulder" />
+                                </div>
+                              ) : k === 'audio' ? (
+                                <div className="lp-audiobars small">
+                                  {[40, 70, 95, 55, 80, 45, 65].map((h, i) => <span key={i} style={{ height: `${h}%` }} />)}
+                                </div>
+                              ) : (
+                                <div className="lp-document small">
+                                  <span /><span /><span />
+                                </div>
+                              )}
+                              <button
+                                type="button"
+                                className="forge-libv2-card-del"
+                                onClick={(e) => { e.stopPropagation(); deleteRecent(entry.jobId); }}
+                                aria-label="Xoá"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            </div>
+                            <div className="forge-libv2-card-body">
+                              <div className="forge-libv2-card-name" title={firstName}>{shortName}</div>
+                              <div className="forge-libv2-card-meta">
+                                <span className="forge-libv2-card-date">{dateStr}</span>
+                                <span className={`forge-libv2-card-tag tag-${k}`}>{colorTag(k)}</span>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
                     </div>
-                    <button type="button" className="forge-lib-card-open" onClick={() => applyRecent(entry)}>
-                      Mở lại job <ArrowRight size={13} />
-                    </button>
-                  </div>
-                ))}
+                  ) : (
+                    <div className="forge-libv2-list">
+                      {filtered.map((entry) => {
+                        const k = kindOf(entry);
+                        const firstName = entry.files[0]?.fileName || entry.toolTitle;
+                        const dateStr = new Date(entry.createdAt).toLocaleDateString('vi-VN').replaceAll('/', '.');
+                        return (
+                          <div key={entry.jobId} className={`forge-libv2-row kind-${k}`}>
+                            <div className={`forge-libv2-row-thumb tag-${k}`}>
+                              {k === 'image' ? <Image size={14} /> : k === 'audio' ? <Mic size={14} /> : <FileText size={14} />}
+                            </div>
+                            <div className="forge-libv2-row-body">
+                              <strong title={firstName}>{firstName}</strong>
+                              <small>{entry.toolTitle} · {relativeTime(entry.createdAt)} · {entry.files.length} file</small>
+                            </div>
+                            <span className={`forge-libv2-card-tag tag-${k}`}>{colorTag(k)}</span>
+                            <span className="forge-libv2-row-date">{dateStr}</span>
+                            <div className="forge-libv2-row-actions">
+                              <button type="button" onClick={() => applyRecent(entry)} title="Mở lại"><ArrowRight size={13} /></button>
+                              <button type="button" onClick={() => deleteRecent(entry.jobId)} title="Xoá" className="danger"><Trash2 size={13} /></button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </main>
               </div>
-            </>
-          )}
-        </section>
+            </section>
+          );
+        })()
+
       ) : (
         <section className="forge-files-section">
           <div className="forge-media-hero" style={{ marginBottom: 24 }}>

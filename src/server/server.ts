@@ -14,6 +14,7 @@ import sharp from 'sharp';
 import { appConfig, getApiOrigin } from '../shared/app-config.js';
 import { getNewsStore, publicArticle, refreshNewsFeed, reenrichArticle } from './content-studio/index.js';
 import { fetchTranscriptWithYtdlp, humanizeYtdlpError, TranscriptResult } from './transcript.js';
+import { separateStems, isDemucsReady, newStemsJobDir, StemsResult } from './stems.js';
 
 type OutputFormat = 'mp4' | 'mp3';
 type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
@@ -40,6 +41,7 @@ type FileTool =
   | 'image-metadata'
   | 'scan-document'
   | 'remove-background'
+  | 'remove-object'
   | 'chroma-key'
   | 'crop-image'
   | 'rotate-image'
@@ -72,6 +74,7 @@ const fileToolExtensions: Record<FileTool, string[]> = {
   'image-metadata': imageExtensions,
   'scan-document': imageExtensions,
   'remove-background': imageExtensions,
+  'remove-object': imageExtensions,
   'chroma-key': imageExtensions,
   'crop-image': imageExtensions,
   'rotate-image': imageExtensions,
@@ -368,6 +371,47 @@ async function resolveYtdlpRunner() {
   }
 
   throw new Error('yt-dlp is not available. Install yt-dlp or set YTDLP_PATH.');
+}
+
+function resolveYtdlpCookiesPath() {
+  const directPath = String(process.env.YTDLP_COOKIES_PATH || process.env.YOUTUBE_COOKIES_PATH || '').trim();
+  if (directPath && fs.existsSync(directPath)) {
+    return directPath;
+  }
+
+  const rawBase64 = String(process.env.YTDLP_COOKIES_BASE64 || process.env.YOUTUBE_COOKIES_BASE64 || '').trim();
+  const rawContent = String(process.env.YTDLP_COOKIES_CONTENT || process.env.YOUTUBE_COOKIES_CONTENT || '').trim();
+  if (!rawBase64 && !rawContent) {
+    return null;
+  }
+
+  const cookieDir = path.join(DOWNLOAD_DIR, '.secrets');
+  fs.mkdirSync(cookieDir, { recursive: true });
+  const cookiePath = path.join(cookieDir, 'youtube-cookies.txt');
+  const content = rawBase64
+    ? Buffer.from(rawBase64, 'base64').toString('utf8')
+    : rawContent.replace(/\\n/g, '\n');
+
+  if (!content.includes('youtube.com') && !content.includes('.youtube.com')) {
+    console.warn('[yt-dlp] cookies env is present but does not look like a Netscape YouTube cookies file.');
+  }
+  fs.writeFileSync(cookiePath, content, { encoding: 'utf8', mode: 0o600 });
+  return cookiePath;
+}
+
+function ytdlpAuthArgs() {
+  const args: string[] = [];
+  const cookiesPath = resolveYtdlpCookiesPath();
+  if (cookiesPath) {
+    args.push('--cookies', cookiesPath);
+  }
+
+  const browser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
+  if (browser) {
+    args.push('--cookies-from-browser', browser);
+  }
+
+  return args;
 }
 
 async function hasYtdlp() {
@@ -1176,6 +1220,247 @@ async function pdfToWordEditableLayout(inputPath: string, outputPath: string) {
   }
 }
 
+async function getPdfTextCharacterCount(inputPath: string) {
+  const parser = new PDFParse({
+    data: new Uint8Array(fs.readFileSync(inputPath)),
+    disableFontFace: true,
+    useSystemFonts: true,
+    isOffscreenCanvasSupported: false
+  });
+
+  try {
+    const result = await parser.getText();
+    const text = cleanPdfText(result.text || '');
+    return text.replace(/\s+/g, '').length;
+  } catch {
+    return 0;
+  } finally {
+    await parser.destroy();
+  }
+}
+
+async function getPdfScanProfile(inputPath: string) {
+  const mod = await import('pdf-lib');
+  const bytes = fs.readFileSync(inputPath);
+  const pdf = await mod.PDFDocument.load(bytes, { ignoreEncryption: true });
+  const pages = pdf.getPages();
+  const pageCount = pages.length;
+  const imagePages = pages.filter((page) => {
+    try {
+      const node = page.node as unknown as {
+        Resources?: () => {
+          lookup?: (key: unknown) => { keys?: () => unknown[]; lookup?: (key: unknown) => unknown } | undefined;
+        } | undefined;
+      };
+      const xObjects = node.Resources?.()?.lookup?.(mod.PDFName.of('XObject'));
+      const keys = xObjects?.keys?.() || [];
+      if (!keys.length) return false;
+      return keys.some((key) => {
+        const value = xObjects?.lookup?.(key);
+        const obj = value as { dict?: { get?: (key: unknown) => unknown } };
+        const subtype = obj.dict?.get?.(mod.PDFName.of('Subtype'));
+        return String(subtype) === '/Image';
+      });
+    } catch {
+      return false;
+    }
+  }).length;
+
+  const rotations = pages.map((page) => page.getRotation().angle);
+  return {
+    pageCount,
+    imagePages,
+    imagePageRatio: pageCount ? imagePages / pageCount : 0,
+    rotations
+  };
+}
+
+async function findPythonForScanOcr() {
+  const candidates = ['python', 'python3', 'py'];
+  for (const candidate of candidates) {
+    if (!(await hasCommand(candidate, ['--version'], 5000))) continue;
+    if (await hasCommand(candidate, ['-c', 'import fitz, pytesseract, docx, PIL'], 8000)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function findTesseractCommand() {
+  const envCmd = String(process.env.TESSERACT_CMD || '').trim();
+  const candidates = [
+    envCmd,
+    'tesseract',
+    'C:\\Program Files\\Tesseract-OCR\\tesseract.exe',
+    'C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe'
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (await hasCommand(candidate, ['--version'], 8000)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function findOcrmypdfCommand() {
+  const envCmd = String(process.env.OCRMYPDF_CMD || '').trim();
+  const candidates = [envCmd, 'ocrmypdf'].filter(Boolean);
+  for (const c of candidates) {
+    if (await hasCommand(c, ['--version'], 8000)) return c;
+  }
+  // Python -m fallback
+  for (const py of ['python', 'python3', 'py']) {
+    if (!(await hasCommand(py, ['--version'], 5000))) continue;
+    if (await hasCommand(py, ['-m', 'ocrmypdf', '--version'], 8000)) {
+      return `${py} -m ocrmypdf`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Premium scanned-PDF → Word pipeline: add OCR text layer via ocrmypdf
+ * (Tesseract + Vietnamese), then pdf2docx — preserves tables, layout, columns.
+ */
+async function scanPdfToWordOcrmyPdf(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const ocrmypdfCmd = await findOcrmypdfCommand();
+  if (!ocrmypdfCmd) {
+    throw new Error('OCRMYPDF_FALLBACK');
+  }
+  const tesseractCmd = await findTesseractCommand();
+  if (!tesseractCmd) {
+    throw new Error('PDF scan cần Tesseract OCR. Cài Tesseract + gói ngôn ngữ vie+eng rồi thử lại.');
+  }
+  const pdf2docxReady = await hasCommand('pdf2docx', ['--help'], 12000);
+  if (!pdf2docxReady) {
+    throw new Error('Cần pdf2docx để xuất Word có table/format. Cài: pip install pdf2docx');
+  }
+
+  const lang = String(options.ocrLang || 'vie+eng').replace(/[^a-zA-Z+_-]/g, '') || 'vie+eng';
+  const force = String(options.ocrForce ?? 'true') !== 'false';
+  const deskew = String(options.ocrDeskew ?? 'true') !== 'false';
+  const cleanFinalRequested = String(options.ocrClean ?? 'true') !== 'false';
+  const unpaperReady = await hasCommand('unpaper', ['--version'], 5000);
+  const cleanFinal = cleanFinalRequested && unpaperReady;
+  if (cleanFinalRequested && !unpaperReady) {
+    console.warn('[pdf-to-word] unpaper missing — skipping --clean-final (install: linux=apt, win=choco install unpaper)');
+  }
+  const jobDir = path.dirname(inputPath);
+  const tempOcrPdf = path.join(jobDir, `ocr-${randomUUID().slice(0, 8)}.pdf`);
+
+  const ocrArgs: string[] = [
+    '--language', lang,
+    '--output-type', 'pdf',
+    '--optimize', '0',
+    '--rotate-pages',
+    '--quiet'
+  ];
+  if (force) ocrArgs.push('--force-ocr');
+  else ocrArgs.push('--skip-text'); // skip pages already containing text
+  if (deskew) ocrArgs.push('--deskew');
+  if (cleanFinal) ocrArgs.push('--clean-final');
+
+  // Resolve command (might be "python -m ocrmypdf" — split if needed)
+  const [bin, ...prefix] = ocrmypdfCmd.split(' ');
+  try {
+    await run(bin, [...prefix, ...ocrArgs, inputPath, tempOcrPdf], {
+      timeoutMs: 10 * 60 * 1000,
+      env: { ...process.env, TESSERACT_CMD: tesseractCmd }
+    });
+    if (!fs.existsSync(tempOcrPdf)) {
+      throw new Error('ocrmypdf không tạo được PDF có OCR text layer.');
+    }
+    await run('pdf2docx', ['convert', tempOcrPdf, outputPath], { timeoutMs: 5 * 60 * 1000 });
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 200) {
+      throw new Error('pdf2docx không tạo được DOCX từ PDF đã OCR.');
+    }
+  } finally {
+    try { fs.unlinkSync(tempOcrPdf); } catch { /* ignore */ }
+  }
+}
+
+async function scanPdfToWordOcr(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const script = path.join(ROOT, 'scripts', 'scan_to_docx.py');
+  if (!fs.existsSync(script)) {
+    throw new Error('Thiếu scripts/scan_to_docx.py để OCR PDF scan sang Word.');
+  }
+  const tesseractCmd = await findTesseractCommand();
+  if (!tesseractCmd) {
+    throw new Error('PDF này là file scan/ảnh và cần Tesseract OCR để tạo Word có text chỉnh sửa được. Local hiện chưa có tesseract. Cài Tesseract OCR + gói vie/eng, rồi chạy lại server.');
+  }
+  const pythonCmd = await findPythonForScanOcr();
+  if (!pythonCmd) {
+    throw new Error('PDF scan cần Python OCR packages. Cài local: python -m pip install pymupdf pytesseract pillow python-docx');
+  }
+
+  const lang = String(options.ocrLang || 'vie').replace(/[^a-zA-Z+_-]/g, '') || 'vie';
+  const dpi = clampInt(options.ocrDpi, 220, 120, 360);
+  const psm = clampInt(options.ocrPsm, 4, 3, 11);
+  const pageLabel = String(options.pageLabel ?? 'false') === 'true';
+  const outputMode = pickString(options.ocrOutput, ['editable', 'visual'] as const, 'editable');
+
+  await run(pythonCmd, [
+    script,
+    inputPath,
+    outputPath,
+    '--lang', lang,
+    '--dpi', String(dpi),
+    '--psm', String(psm),
+    '--page-label', pageLabel ? '1' : '0',
+    '--tesseract-cmd', tesseractCmd,
+    '--output-mode', outputMode
+  ], { timeoutMs: 10 * 60 * 1000 });
+
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 200) {
+    throw new Error('OCR không tạo được DOCX hợp lệ từ file scan.');
+  }
+}
+
+async function pdfToWordSmart(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const mode = pickString(options.pdfMode, ['auto', 'editable', 'ocr'] as const, 'auto');
+  const [textChars, scanProfile] = await Promise.all([
+    getPdfTextCharacterCount(inputPath),
+    getPdfScanProfile(inputPath)
+  ]);
+  const isImageOnlyPdf = scanProfile.pageCount > 0 && scanProfile.imagePageRatio >= 0.8;
+  const isScanned = textChars < 80 || isImageOnlyPdf;
+
+  // Helper: try ocrmypdf+pdf2docx (best: preserves tables/format), fallback to scan_to_docx.py
+  async function runOcrPipeline() {
+    try {
+      await scanPdfToWordOcrmyPdf(inputPath, outputPath, options);
+      console.warn('[pdf-to-word] used ocrmypdf+pdf2docx (premium pipeline, tables preserved)');
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg !== 'OCRMYPDF_FALLBACK' && !String(options.allowFallback ?? 'true') !== false) {
+        // ocrmypdf was available but failed — propagate the real error
+        if (!msg.startsWith('OCRMYPDF_FALLBACK')) console.warn('[pdf-to-word] ocrmypdf failed, fallback:', msg.slice(0, 200));
+      }
+      // Fallback to tesseract-only line-based DOCX (no tables but readable text)
+      await scanPdfToWordOcr(inputPath, outputPath, options);
+      console.warn('[pdf-to-word] used scan_to_docx.py fallback (no ocrmypdf available)');
+    }
+  }
+
+  if (mode === 'ocr') {
+    await runOcrPipeline();
+    return;
+  }
+
+  if (isScanned) {
+    console.warn(`[pdf-to-word] scanned/image PDF detected: textChars=${textChars}, imagePages=${scanProfile.imagePages}/${scanProfile.pageCount}, rotations=${scanProfile.rotations.join(',')}`);
+    if (mode === 'editable') {
+      throw new Error('PDF này là file scan/ảnh, không có text layer. Chọn chế độ Auto hoặc OCR để chạy pipeline OCR (cần cài Tesseract + ocrmypdf cho chất lượng tốt nhất).');
+    }
+    await runOcrPipeline();
+    return;
+  }
+
+  await pdfToWordEditableLayout(inputPath, outputPath);
+}
+
 async function convertWithLibreOffice(inputPath: string, outputDir: string, targetFormat: 'pdf' | 'docx') {
   const ready = await hasCommand(SOFFICE, libreOfficeHealthArgs(), 12000);
   if (!ready) {
@@ -1406,6 +1691,131 @@ async function removeBackground(inputPath: string, outputPath: string, options: 
   await run('rembg', ['i', '-m', model, inputPath, outputPath], { timeoutMs: 180000 });
   if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 100) {
     throw new Error('rembg không tạo được file PNG sạch nền.');
+  }
+}
+
+/**
+ * Object removal via OpenCV inpaint.
+ * Mode 'auto': run rembg → use foreground alpha as mask (inpaints the subject, keeps background).
+ * Mode 'manual': caller provides base64 PNG mask in options.maskDataUrl (white = inpaint).
+ */
+async function removeObject(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const inpaintScript = path.join(ROOT, 'scripts', 'inpaint.py');
+  if (!fs.existsSync(inpaintScript)) {
+    throw new Error('Thiếu scripts/inpaint.py — không tách được vật thể.');
+  }
+
+  // Find a Python interpreter that has cv2 installed (not just any Python)
+  // On Windows there are often multiple Python installs — python3 might resolve to a different
+  // version than python. We probe each candidate for cv2 to pick the right one.
+  const pythonCandidates = ['python', 'python3', 'py'];
+  let pythonCmd: string | null = null;
+  for (const candidate of pythonCandidates) {
+    if (!(await hasCommand(candidate, ['--version']))) continue;
+    if (await hasCommand(candidate, ['-c', 'import cv2'])) {
+      pythonCmd = candidate;
+      break;
+    }
+  }
+  if (!pythonCmd) {
+    // Fallback: at least find a working Python (so the error is more helpful)
+    for (const candidate of pythonCandidates) {
+      if (await hasCommand(candidate, ['--version'])) {
+        const pyVer = candidate;
+        throw new Error(
+          `Cần opencv-python (cv2) cho ${pyVer}. ` +
+          `Cài bằng: ${pyVer} -m pip install opencv-python-headless`
+        );
+      }
+    }
+    throw new Error('Cần Python 3 + opencv-python để chạy inpaint. Cài Python và "pip install opencv-python-headless".');
+  }
+
+  const mode = pickString(options.mode, ['auto', 'manual'] as const, 'auto');
+  const method = pickString(options.method, ['auto', 'ldm', 'lama', 'telea', 'ns'] as const, 'auto');
+  const dilate = clampInt(options.dilate, 12, 0, 40);
+  const feather = clampInt(options.feather, 3, 0, 40);
+  const ldmSteps = clampInt(options.ldmSteps, 35, 10, 50);
+  const removeShadow = String(options.removeShadow ?? 'true') !== 'false';
+  const removeReflection = String(options.removeReflection ?? 'true') !== 'false';
+  const premium = String(options.premium ?? 'true') !== 'false';
+  const jobDir = path.dirname(inputPath);
+  const maskPath = path.join(jobDir, `mask-${randomUUID().slice(0, 8)}.png`);
+
+  // Build mask
+  if (mode === 'auto') {
+    // Run rembg to get foreground, then extract alpha as mask
+    const ready = await hasCommand('rembg', ['--version'], 8000);
+    if (!ready) {
+      throw new Error('Auto-detect cần rembg. Cài bằng: pip install "rembg[cpu]" — hoặc dùng chế độ Manual brush.');
+    }
+    const model = pickString(
+      options.detectModel,
+      ['u2net', 'u2netp', 'silueta', 'isnet-general-use', 'isnet-anime'] as const,
+      'u2net'
+    );
+    const rembgOut = path.join(jobDir, `rembg-${randomUUID().slice(0, 8)}.png`);
+    await run('rembg', ['i', '-m', model, inputPath, rembgOut], { timeoutMs: 180000 });
+    if (!fs.existsSync(rembgOut)) {
+      throw new Error('rembg không tạo được file để extract mask.');
+    }
+
+    // Extract alpha channel as grayscale mask
+    const { data, info } = await sharp(rembgOut)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const { width, height, channels } = info;
+    const mask = Buffer.alloc(width * height);
+    for (let i = 0; i < width * height; i++) {
+      // Subject pixel = high alpha = inpaint here
+      mask[i] = data[i * channels + 3];
+    }
+    await sharp(mask, { raw: { width, height, channels: 1 } })
+      .png()
+      .toFile(maskPath);
+    try { fs.unlinkSync(rembgOut); } catch { /* ignore */ }
+  } else {
+    // Manual mode: maskDataUrl is base64 PNG
+    const dataUrl = typeof options.maskDataUrl === 'string' ? options.maskDataUrl : '';
+    const match = /^data:image\/png;base64,(.+)$/.exec(dataUrl);
+    if (!match) {
+      throw new Error('Thiếu maskDataUrl (base64 PNG) cho chế độ Manual brush.');
+    }
+    const maskBuffer = Buffer.from(match[1], 'base64');
+    if (maskBuffer.length < 200) {
+      throw new Error('Mask quá nhỏ — chưa vẽ vùng nào cần xoá?');
+    }
+    // Convert to grayscale and resize to match input
+    const inputMeta = await sharp(inputPath).metadata();
+    await sharp(maskBuffer)
+      .resize(inputMeta.width, inputMeta.height, { fit: 'fill' })
+      .grayscale()
+      .png()
+      .toFile(maskPath);
+  }
+
+  // Run inpaint — LDM 30-90s, LaMa 10-15s on CPU. First run also downloads model.
+  try {
+    await run(pythonCmd, [
+      inpaintScript,
+      inputPath,
+      maskPath,
+      outputPath,
+      '--method', method,
+      '--dilate', String(dilate),
+      '--feather', String(feather),
+      '--ldm-steps', String(ldmSteps),
+      '--remove-shadow', removeShadow ? '1' : '0',
+      '--remove-reflection', removeReflection ? '1' : '0',
+      '--premium', premium ? '1' : '0'
+    ], { timeoutMs: 8 * 60 * 1000 });
+  } finally {
+    try { fs.unlinkSync(maskPath); } catch { /* ignore */ }
+  }
+
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 200) {
+    throw new Error('Inpaint xuất file rỗng — vật thể có thể quá lớn so với ảnh.');
   }
 }
 
@@ -1803,7 +2213,7 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
     }
     case 'pdf-to-word': {
       const outputPath = out('', 'docx');
-      await pdfToWordEditableLayout(inputPath, outputPath);
+      await pdfToWordSmart(inputPath, outputPath, options);
       return outputPath;
     }
     case 'image-to-png': {
@@ -1875,6 +2285,11 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
     case 'remove-background': {
       const outputPath = safeOut('-nobg', 'png');
       await removeBackground(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'remove-object': {
+      const outputPath = safeOut('-clean', 'png');
+      await removeObject(inputPath, outputPath, options);
       return outputPath;
     }
     case 'chroma-key': {
@@ -2543,6 +2958,13 @@ async function processJob(job: ConvertJob) {
       'node',
       '--remote-components',
       'ejs:github',
+      '--extractor-args',
+      'youtube:player_client=default,ios,web',
+      '--retries',
+      '3',
+      '--fragment-retries',
+      '3',
+      ...ytdlpAuthArgs(),
       '--windows-filenames',
       '--no-mtime',
       '--newline',
@@ -2580,13 +3002,15 @@ async function processJob(job: ConvertJob) {
     });
   } catch (error) {
     fs.rmSync(job.jobDir, { recursive: true, force: true });
+    const rawError = error instanceof Error ? error.message : 'Unknown conversion error.';
     updateJob(job, {
       status: 'failed',
       progress: 100,
       step: 'Failed',
-      error: error instanceof Error ? error.message : 'Unknown conversion error.'
+      error: humanizeYtdlpError(rawError)
     });
-    addLog(job, job.error || 'Unknown conversion error.');
+    if (job.error !== rawError) addLog(job, job.error || 'Unknown conversion error.');
+    addLog(job, rawError);
   }
 }
 
@@ -2654,15 +3078,35 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady, rembgReady, fasterWhisperReady, whisperReady] = await Promise.all([
+      // Probe python for opencv + LaMa availability
+      const probeLama = async (): Promise<{ opencv: boolean; lama: boolean }> => {
+        const candidates = ['python', 'python3', 'py'];
+        for (const cmd of candidates) {
+          if (!(await hasCommand(cmd, ['--version'], 5000))) continue;
+          const opencv = await hasCommand(cmd, ['-c', 'import cv2'], 6000);
+          const lama = await hasCommand(cmd, ['-c', 'from simple_lama_inpainting import SimpleLama'], 8000);
+          if (opencv || lama) return { opencv, lama };
+        }
+        return { opencv: false, lama: false };
+      };
+      const probeScanOcr = async (): Promise<boolean> => {
+        if (!(await findTesseractCommand())) return false;
+        return Boolean(await findPythonForScanOcr());
+      };
+
+      const [ytdlpReady, ffmpegReady, ffprobeReady, libreOfficeReady, pdf2docxReady, scanOcrReady, rembgReady, fasterWhisperReady, whisperReady, demucsReady, inpaintProbe, ocrmypdfReady] = await Promise.all([
         hasYtdlp(),
         hasCommand('ffmpeg', ['-version'], 5000),
         hasCommand('ffprobe', ['-version'], 5000),
         hasCommand(SOFFICE, libreOfficeHealthArgs(), 12000),
         hasCommand('pdf2docx', ['--help'], 12000),
+        probeScanOcr(),
         hasCommand('rembg', ['--version'], 8000),
         hasCommand('faster-whisper', ['--help'], 6000),
-        hasCommand('whisper', ['--help'], 6000)
+        hasCommand('whisper', ['--help'], 6000),
+        isDemucsReady((cmd, args) => hasCommand(cmd, args, 8000)),
+        probeLama(),
+        findOcrmypdfCommand().then((c) => Boolean(c))
       ]);
 
       sendJson(res, 200, {
@@ -2672,8 +3116,14 @@ const server = http.createServer(async (req, res) => {
         ffprobeReady,
         libreOfficeReady,
         pdf2docxReady,
+        scanOcrReady,
+        ocrmypdfReady,
         rembgReady,
         whisperReady: fasterWhisperReady || whisperReady,
+        demucsReady,
+        opencvReady: inpaintProbe.opencv,
+        lamaReady: inpaintProbe.lama,
+        ytdlpCookiesReady: Boolean(resolveYtdlpCookiesPath() || process.env.YTDLP_COOKIES_FROM_BROWSER),
         openAIReady: Boolean(process.env.OPENAI_API_KEY),
         nodeVersion: process.version,
         message: ytdlpReady && ffmpegReady && ffprobeReady ? 'Ready' : 'Missing required tools'
@@ -2726,6 +3176,55 @@ const server = http.createServer(async (req, res) => {
         const friendly = humanizeYtdlpError(raw);
         console.error('[transcript] error:', raw.slice(0, 500));
         sendJson(res, 502, { error: friendly, rawError: raw.slice(0, 800) });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/audio/stems') {
+      const body = await parseBody(req) as { url?: string; model?: string };
+      const inputUrl = String(body.url || '').trim();
+      if (!inputUrl) {
+        sendJson(res, 400, { error: 'URL không được trống.' });
+        return;
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(inputUrl);
+      } catch {
+        sendJson(res, 400, { error: 'URL không hợp lệ.' });
+        return;
+      }
+      if (!/^https?:$/.test(parsedUrl.protocol)) {
+        sendJson(res, 400, { error: 'URL phải bắt đầu với http(s)://' });
+        return;
+      }
+
+      const allowedModels = ['htdemucs', 'htdemucs_ft', 'mdx_extra'] as const;
+      type ModelName = typeof allowedModels[number];
+      const requestedModel = String(body.model || 'htdemucs') as ModelName;
+      const model: ModelName = allowedModels.includes(requestedModel) ? requestedModel : 'htdemucs';
+
+      const { jobId, jobDir } = newStemsJobDir(DOWNLOAD_DIR);
+
+      try {
+        const ytdlpRunner = await resolveYtdlpRunner();
+        const result: StemsResult = await separateStems({
+          url: inputUrl,
+          jobDir,
+          jobId,
+          downloadsBase: '/downloads',
+          model,
+          runYtdlp: async (args, opts) => run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], opts),
+          runCommand: async (command, args, opts) => run(command, args, opts || {}),
+          hasCommand: (command, args) => hasCommand(command, args, 8000)
+        });
+        sendJson(res, 200, result);
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : 'Tách stems thất bại.';
+        const code = (error as { code?: string })?.code;
+        const status = code === 'DEMUCS_NOT_INSTALLED' ? 503 : 502;
+        console.error('[stems] error:', raw.slice(0, 500));
+        sendJson(res, status, { error: humanizeYtdlpError(raw), rawError: raw.slice(0, 800), code });
       }
       return;
     }
@@ -2845,6 +3344,89 @@ const server = http.createServer(async (req, res) => {
         items,
         files: allFiles
       });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/detect-objects') {
+      const upload = await parseMultipartUpload(req);
+      if (!upload.files.length) {
+        fs.rmSync(upload.jobDir, { recursive: true, force: true });
+        sendJson(res, 400, { error: 'Cần upload 1 ảnh để phát hiện vật thể.' });
+        return;
+      }
+      const imagePath = upload.files[0].filePath;
+      const detectScript = path.join(ROOT, 'scripts', 'detect_objects.py');
+      if (!fs.existsSync(detectScript)) {
+        sendJson(res, 500, { error: 'Thiếu scripts/detect_objects.py' });
+        return;
+      }
+
+      // Find python with ultralytics
+      const pyCandidates = ['python', 'python3', 'py'];
+      let pyCmd: string | null = null;
+      for (const c of pyCandidates) {
+        if (!(await hasCommand(c, ['--version'], 5000))) continue;
+        if (await hasCommand(c, ['-c', 'import ultralytics'], 12000)) { pyCmd = c; break; }
+      }
+      if (!pyCmd) {
+        sendJson(res, 503, {
+          error: 'Auto phát hiện vật thể cần YOLOv8. Cài: pip install ultralytics. Hoặc dùng Manual brush.',
+          code: 'YOLO_NOT_INSTALLED'
+        });
+        return;
+      }
+
+      const model = pickString(upload.options.detectModel, ['yolov8x-seg.pt', 'yolov8l-seg.pt', 'yolov8m-seg.pt', 'yolov8n-seg.pt'] as const, 'yolov8m-seg.pt');
+      try {
+        const { stdout } = await run(pyCmd, [
+          detectScript, imagePath, upload.jobDir, '--conf', '0.30', '--model', model
+        ], { timeoutMs: 5 * 60 * 1000 });
+        const jsonLine = stdout.split('\n').reverse().find((l) => l.trim().startsWith('{'));
+        if (!jsonLine) throw new Error('Detection không trả JSON.');
+        const detection = JSON.parse(jsonLine) as {
+          width: number; height: number; error?: string;
+          objects: Array<{ id: number; label: string; confidence: number; bbox: number[]; area_pct: number; cx: number; cy: number; is_main: boolean; mask_file: string }>;
+          secondary_mask_file: string | null;
+          main_count?: number; secondary_count?: number;
+        };
+        if (detection.error) throw new Error(detection.error);
+
+        const labelVi: Record<string, string> = {
+          person: 'Người', bicycle: 'Xe đạp', car: 'Ô tô', motorcycle: 'Xe máy',
+          bus: 'Xe buýt', truck: 'Xe tải', dog: 'Chó', cat: 'Mèo', bird: 'Chim',
+          'potted plant': 'Cây cảnh', chair: 'Ghế', bench: 'Băng ghế', umbrella: 'Ô dù',
+          backpack: 'Ba lô', handbag: 'Túi xách', bottle: 'Chai', cup: 'Cốc',
+          'traffic light': 'Đèn giao thông', boat: 'Thuyền', horse: 'Ngựa', train: 'Tàu'
+        };
+
+        sendJson(res, 200, {
+          jobId: upload.id,
+          width: detection.width,
+          height: detection.height,
+          imageUrl: `/downloads/${upload.id}/${encodeURIComponent(upload.files[0].originalName)}`,
+          mainCount: detection.main_count ?? 0,
+          secondaryCount: detection.secondary_count ?? 0,
+          secondaryMaskUrl: detection.secondary_mask_file
+            ? `/downloads/${upload.id}/${encodeURIComponent(detection.secondary_mask_file)}`
+            : null,
+          objects: detection.objects.map((o) => ({
+            id: o.id,
+            label: o.label,
+            labelVi: labelVi[o.label] || o.label,
+            confidence: o.confidence,
+            bbox: o.bbox,
+            areaPct: o.area_pct,
+            cx: o.cx,
+            cy: o.cy,
+            isMain: o.is_main,
+            maskUrl: `/downloads/${upload.id}/${encodeURIComponent(o.mask_file)}`
+          }))
+        });
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : 'Phát hiện vật thể thất bại.';
+        console.error('[detect-objects] error:', raw.slice(0, 500));
+        sendJson(res, 502, { error: raw.slice(0, 300) });
+      }
       return;
     }
 
