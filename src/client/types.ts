@@ -17,6 +17,13 @@ export interface HealthResponse {
   demucsReady?: boolean;
   opencvReady?: boolean;
   lamaReady?: boolean;
+  publicLimits?: {
+    rateWindowSeconds: number;
+    maxJobsPerWindow: number;
+    maxActiveJobs: number;
+    maxMediaSeconds: number;
+    maxPlaylistItems: number;
+  };
   openAIReady: boolean;
   nodeVersion: string;
   message: string;

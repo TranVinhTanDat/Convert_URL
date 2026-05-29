@@ -2,11 +2,31 @@ services:
   - type: web
     name: convert-url-api
     runtime: docker
+    # IMPORTANT — Plan capacity vs features:
+    #   free      (0.5 GB RAM) → ONLY basic conversions (PDF↔Word, image, Excel). All AI
+    #                            features (xoá vật thể LaMa/LDM, stems, Whisper, YOLO,
+    #                            rembg) will OOM. Use buildArgs to disable them.
+    #   standard  (2 GB RAM)   → rembg + faster-whisper + YOLO work. LaMa marginal.
+    #   pro       (4 GB RAM)   → LaMa works smoothly. LDM/Demucs need pro+.
+    #   pro plus  (8 GB RAM)   → Everything including LDM/Demucs runs fine.
     plan: free
     autoDeploy: true
     healthCheckPath: /api/health
+    # Optional: dockerBuildArgs let you skip heavy features on small plans.
+    # On free plan, set these to "0" to keep the image small + avoid OOM:
+    #   INSTALL_TORCH=0 INSTALL_DEMUCS=0 INSTALL_INPAINT=0 INSTALL_YOLO=0
+    #   INSTALL_REMBG=0 INSTALL_WHISPER=0
+    # dockerBuildArgs:
+    #   INSTALL_DEMUCS: "0"   # uncomment to skip stems audio (saves ~1 GB build)
+    #   INSTALL_INPAINT: "0"  # uncomment to skip LaMa/LDM (saves ~500 MB)
     envVars:
       - key: NODE_ENV
         value: production
       - key: CORS_ORIGIN
         value: "*"
+    # Optional persistent disk for /downloads (jobs survive container restart).
+    # Render free plan does NOT support disks; uncomment on Standard+:
+    # disk:
+    #   name: downloads
+    #   mountPath: /app/downloads
+    #   sizeGB: 5

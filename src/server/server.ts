@@ -115,6 +115,7 @@ interface ConvertJob {
   createdAt: string;
   updatedAt: string;
   jobDir: string;
+  clientIp: string;
 }
 
 interface LocalFile {
@@ -173,6 +174,11 @@ const SOFFICE = resolveLibreOfficeCommand();
 const MAX_BODY_SIZE = 128 * 1024;
 const MAX_UPLOAD_SIZE = 40 * 1024 * 1024;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const PUBLIC_RATE_WINDOW_MS = clampInt(process.env.PUBLIC_RATE_WINDOW_SECONDS, 3600, 60, 86400) * 1000;
+const PUBLIC_RATE_MAX_JOBS = clampInt(process.env.PUBLIC_RATE_MAX_JOBS, 12, 1, 500);
+const PUBLIC_MAX_ACTIVE_JOBS = clampInt(process.env.PUBLIC_MAX_ACTIVE_JOBS, 2, 1, 20);
+const PUBLIC_MAX_MEDIA_SECONDS = clampInt(process.env.PUBLIC_MAX_MEDIA_SECONDS, 1800, 60, 24 * 60 * 60);
+const PUBLIC_MAX_PLAYLIST_ITEMS = clampInt(process.env.PUBLIC_MAX_PLAYLIST_ITEMS, 10, 1, 100);
 
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
@@ -182,6 +188,7 @@ fs.mkdirSync(NEWS_STORE_DIR, { recursive: true });
 const newsStore = getNewsStore(NEWS_STORE_FILE);
 
 const jobs = new Map<string, ConvertJob>();
+const mediaRateBuckets = new Map<string, number[]>();
 let cachedYtdlpRunner: CommandRunner | null = null;
 
 const mimeTypes: Record<string, string> = {
@@ -2369,7 +2376,34 @@ function normalizePayload(payload: Record<string, unknown>): JobOptions {
   };
 }
 
-function createJob(options: JobOptions): ConvertJob {
+function getClientIp(req: http.IncomingMessage) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+
+function assertMediaJobQuota(clientIp: string) {
+  const now = Date.now();
+  const bucket = (mediaRateBuckets.get(clientIp) || []).filter((createdAt) => now - createdAt < PUBLIC_RATE_WINDOW_MS);
+  const activeJobs = Array.from(jobs.values()).filter((job) => {
+    return job.clientIp === clientIp && (job.status === 'queued' || job.status === 'running');
+  }).length;
+
+  if (activeJobs >= PUBLIC_MAX_ACTIVE_JOBS) {
+    throw new Error(`Bạn đang có ${activeJobs} job đang xử lý. Vui lòng chờ job hiện tại hoàn tất rồi thử lại.`);
+  }
+
+  if (bucket.length >= PUBLIC_RATE_MAX_JOBS) {
+    const resetMinutes = Math.max(1, Math.ceil((PUBLIC_RATE_WINDOW_MS - (now - bucket[0])) / 60000));
+    throw new Error(`Bạn đã dùng hết ${PUBLIC_RATE_MAX_JOBS} lượt chuyển đổi trong khung giờ hiện tại. Thử lại sau khoảng ${resetMinutes} phút.`);
+  }
+
+  bucket.push(now);
+  mediaRateBuckets.set(clientIp, bucket);
+}
+
+function createJob(options: JobOptions, clientIp = 'unknown'): ConvertJob {
   const id = randomUUID();
   const jobDir = path.join(DOWNLOAD_DIR, id);
   fs.mkdirSync(jobDir, { recursive: true });
@@ -2385,7 +2419,8 @@ function createJob(options: JobOptions): ConvertJob {
     options,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    jobDir
+    jobDir,
+    clientIp
   };
 
   jobs.set(id, job);
@@ -2970,7 +3005,10 @@ async function processJob(job: ConvertJob) {
       '--newline',
       '--paths',
       job.jobDir,
+      '--match-filter',
+      `duration <= ${PUBLIC_MAX_MEDIA_SECONDS}`,
       job.options.playlist === 'playlist' ? '--yes-playlist' : '--no-playlist',
+      ...(job.options.playlist === 'playlist' ? ['--playlist-end', String(PUBLIC_MAX_PLAYLIST_ITEMS)] : []),
       ...buildFormatArgs(job.options),
       '-o',
       outputTemplate(job.options.filename),
@@ -3124,6 +3162,13 @@ const server = http.createServer(async (req, res) => {
         opencvReady: inpaintProbe.opencv,
         lamaReady: inpaintProbe.lama,
         ytdlpCookiesReady: Boolean(resolveYtdlpCookiesPath() || process.env.YTDLP_COOKIES_FROM_BROWSER),
+        publicLimits: {
+          rateWindowSeconds: Math.round(PUBLIC_RATE_WINDOW_MS / 1000),
+          maxJobsPerWindow: PUBLIC_RATE_MAX_JOBS,
+          maxActiveJobs: PUBLIC_MAX_ACTIVE_JOBS,
+          maxMediaSeconds: PUBLIC_MAX_MEDIA_SECONDS,
+          maxPlaylistItems: PUBLIC_MAX_PLAYLIST_ITEMS
+        },
         openAIReady: Boolean(process.env.OPENAI_API_KEY),
         nodeVersion: process.version,
         message: ytdlpReady && ffmpegReady && ffprobeReady ? 'Ready' : 'Missing required tools'
@@ -3505,7 +3550,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/jobs') {
       const payload = normalizePayload(await parseBody(req));
-      const job = createJob(payload);
+      const clientIp = getClientIp(req);
+      assertMediaJobQuota(clientIp);
+      const job = createJob(payload, clientIp);
       setImmediate(() => processJob(job));
       sendJson(res, 202, publicJob(job));
       return;

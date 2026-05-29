@@ -413,6 +413,9 @@ export function humanizeYtdlpError(rawMessage: string): string {
   if (lower.includes('sign in to confirm') && lower.includes('not a bot')) {
     return 'YouTube dang yeu cau xac minh khong phai bot. Tren Render can cau hinh cookies YouTube cho yt-dlp (YTDLP_COOKIES_BASE64 hoac YTDLP_COOKIES_CONTENT), roi deploy/restart lai.';
   }
+  if (lower.includes('did not pass filter') || lower.includes('does not pass filter')) {
+    return 'Video vuot gioi han thoi luong cua server public. Hay thu video ngan hon hoac tang PUBLIC_MAX_MEDIA_SECONDS neu day la server rieng cua ban.';
+  }
   if (lower.includes('sign in to confirm') || lower.includes('age')) {
     return 'Video bị giới hạn độ tuổi — yt-dlp không lấy được nếu không đăng nhập. Thử URL công khai khác.';
   }
