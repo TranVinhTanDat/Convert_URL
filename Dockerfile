@@ -29,15 +29,17 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade \
 
 # ===== LAYER 3: rembg (xoá nền AI + auto-detect in Xoá vật thể) ~500 MB =====
 # Backend calls `rembg i -m u2net in out` via shell. The rembg 2.x CLI eager-loads
-# all command modules at startup (i/p/s/b) — `s_command` needs gradio + fastapi.
-# We install [cli] for full deps, but skip the runtime `rembg --version` check at
-# build time because gradio 6.x can crash on first init in headless Docker (no
-# display/audio devices). Verification uses Python import only — the actual CLI
-# invocation happens at request time from server.ts and any runtime error there
-# surfaces as a clear "tool not ready" message in /api/health.
+# all command modules at startup (i/p/s/b) — `s_command` needs gradio + fastapi
+# so [cli] extras are required. Separately, `[cpu]` extras pull onnxruntime which
+# is what actually runs the U2Net model. WITHOUT [cpu], even `import rembg`
+# fails with "pip install rembg[cpu]" hint. We install BOTH extras.
+# Build-time verification uses Python import only (CLI init can crash in headless
+# Docker due to gradio 6.x audio/display probes — irrelevant for our backend
+# usage, which spawns `rembg i ...` lazily at request time).
 ARG INSTALL_REMBG=1
 RUN if [ "$INSTALL_REMBG" = "1" ]; then \
-      python3 -m pip install --no-cache-dir --break-system-packages "rembg[cli]" \
+      python3 -m pip install --no-cache-dir --break-system-packages "rembg[cpu,cli]" \
+      && python3 -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)" \
       && python3 -c "import rembg; print('rembg', rembg.__version__, 'imported ok')"; \
     fi
 
