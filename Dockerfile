@@ -27,13 +27,18 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade \
   && python3 -c "import fitz, pytesseract, docx, PIL; print('scan OCR ready')" \
   && python3 -c "import cv2; print('cv2', cv2.__version__, 'xphoto:', hasattr(cv2, 'xphoto'))"
 
-# ===== LAYER 3: rembg (xoá nền AI + auto-detect in Xoá vật thể) ~400 MB =====
-# Uses onnxruntime — no PyTorch needed, lightweight model.
+# ===== LAYER 3: rembg (xoá nền AI + auto-detect in Xoá vật thể) ~500 MB =====
+# Backend calls `rembg i -m u2net in out` via shell. The rembg 2.x CLI eager-loads
+# all command modules at startup (i/p/s/b) — `s_command` needs gradio + fastapi.
+# We install [cli] for full deps, but skip the runtime `rembg --version` check at
+# build time because gradio 6.x can crash on first init in headless Docker (no
+# display/audio devices). Verification uses Python import only — the actual CLI
+# invocation happens at request time from server.ts and any runtime error there
+# surfaces as a clear "tool not ready" message in /api/health.
 ARG INSTALL_REMBG=1
 RUN if [ "$INSTALL_REMBG" = "1" ]; then \
       python3 -m pip install --no-cache-dir --break-system-packages "rembg[cli]" \
-      && rembg --version > /dev/null \
-      && python3 -c "import rembg; print('rembg ok')"; \
+      && python3 -c "import rembg; print('rembg', rembg.__version__, 'imported ok')"; \
     fi
 
 # ===== LAYER 4: faster-whisper (transcript AI local) ~200 MB =====
@@ -65,12 +70,15 @@ RUN if [ "$INSTALL_DEMUCS" = "1" ] && [ "$INSTALL_TORCH" = "1" ]; then \
 # ===== LAYER 7: iopaint LaMa/LDM (Xoá vật thể PRIMARY engine) ~500 MB =====
 # This is the main inpaint engine for "Xoá vật thể". Without it, xoá vật thể falls
 # back to cv2 (lower quality). simple-lama-inpainting added as lighter fallback.
+# iopaint pulls gradio+fastapi as transitive deps for its server mode; we don't
+# use that here, so we only verify the model_manager Python import (no CLI/gradio
+# init triggered) which is what server-side code actually uses.
 ARG INSTALL_INPAINT=1
 RUN if [ "$INSTALL_INPAINT" = "1" ] && [ "$INSTALL_TORCH" = "1" ]; then \
       python3 -m pip install --no-cache-dir --break-system-packages \
         simple-lama-inpainting iopaint \
-      && python3 -c "from simple_lama_inpainting import SimpleLama; print('simple-lama ok')" \
-      && python3 -c "from iopaint.model_manager import ModelManager; print('iopaint ok')"; \
+      && python3 -c "from simple_lama_inpainting import SimpleLama; print('simple-lama imported')" \
+      && python3 -c "from iopaint.model_manager import ModelManager; print('iopaint.model_manager imported')"; \
     fi
 
 # ===== LAYER 8: ultralytics YOLOv8 (Smart object detect for Xoá vật thể) ~200 MB =====
