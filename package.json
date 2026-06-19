@@ -11,6 +11,8 @@
     "build:client": "tsc -b tsconfig.client.json && vite build",
     "build:server": "tsc -b tsconfig.server.json",
     "preview": "node dist/server/server/server.js",
+    "share": "npm run build && concurrently -k -n APP,TUNNEL -c green,cyan \"node dist/server/server/server.js\" \"cloudflared tunnel --url http://localhost:5175\"",
+    "tunnel": "cloudflared tunnel --url http://localhost:5175",
     "check": "tsc -b --pretty false"
   },
   "engines": {
