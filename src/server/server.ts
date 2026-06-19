@@ -1317,6 +1317,24 @@ async function findPythonForScanOcr() {
   return null;
 }
 
+// Count editable text characters in a DOCX (paragraphs + table cells) via python-docx.
+// Used to detect image-only DOCX output from pdf2docx. Returns a high number if it
+// can't check (no Python) so we don't force an unnecessary fallback.
+async function docxTextLength(docxPath: string): Promise<number> {
+  const py = await findPythonForScanOcr();
+  if (!py) return Number.MAX_SAFE_INTEGER;
+  try {
+    const { stdout } = await run(py, ['-c',
+      'import sys,docx;d=docx.Document(sys.argv[1]);'
+      + 'n=sum(len(p.text.strip()) for p in d.paragraphs);'
+      + 'n+=sum(len(c.text.strip()) for t in d.tables for r in t.rows for c in r.cells);'
+      + 'print(n)', docxPath], { timeoutMs: 30000 });
+    return parseInt(stdout.trim(), 10) || 0;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
 async function findTesseractCommand() {
   const envCmd = String(process.env.TESSERACT_CMD || '').trim();
   const candidates = [
@@ -1457,22 +1475,29 @@ async function pdfToWordSmart(inputPath: string, outputPath: string, options: To
   const isImageOnlyPdf = scanProfile.pageCount > 0 && scanProfile.imagePageRatio >= 0.8;
   const isScanned = textChars < 80 || isImageOnlyPdf;
 
-  // Helper: try ocrmypdf+pdf2docx (best: preserves tables/format), fallback to scan_to_docx.py
+  // Helper: try ocrmypdf+pdf2docx (best when it keeps text/tables), but pdf2docx
+  // often embeds an OCR'd image-only scan as a picture and drops the text layer —
+  // producing a DOCX with NO editable text. So we verify the output actually has
+  // text; if it's image-only (or ocrmypdf is unavailable/fails), fall back to the
+  // line-based scan_to_docx.py which always yields editable text paragraphs.
   async function runOcrPipeline() {
     try {
       await scanPdfToWordOcrmyPdf(inputPath, outputPath, options);
-      console.warn('[pdf-to-word] used ocrmypdf+pdf2docx (premium pipeline, tables preserved)');
-      return;
+      const textLen = await docxTextLength(outputPath);
+      if (textLen >= 20) {
+        console.warn(`[pdf-to-word] used ocrmypdf+pdf2docx (text preserved, ${textLen} chars)`);
+        return;
+      }
+      console.warn(`[pdf-to-word] pdf2docx produced image-only DOCX (textLen=${textLen}) — falling back to line-based OCR for editable text`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg !== 'OCRMYPDF_FALLBACK' && !String(options.allowFallback ?? 'true') !== false) {
-        // ocrmypdf was available but failed — propagate the real error
-        if (!msg.startsWith('OCRMYPDF_FALLBACK')) console.warn('[pdf-to-word] ocrmypdf failed, fallback:', msg.slice(0, 200));
+      if (!msg.startsWith('OCRMYPDF_FALLBACK')) {
+        console.warn('[pdf-to-word] ocrmypdf+pdf2docx failed, falling back:', msg.slice(0, 200));
       }
-      // Fallback to tesseract-only line-based DOCX (no tables but readable text)
-      await scanPdfToWordOcr(inputPath, outputPath, options);
-      console.warn('[pdf-to-word] used scan_to_docx.py fallback (no ocrmypdf available)');
     }
+    // Line-based tesseract OCR → editable text paragraphs (no tables, but selectable text).
+    await scanPdfToWordOcr(inputPath, outputPath, options);
+    console.warn('[pdf-to-word] used scan_to_docx.py (editable text)');
   }
 
   if (mode === 'ocr') {
