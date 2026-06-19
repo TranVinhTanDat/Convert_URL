@@ -25,6 +25,8 @@ export interface HealthResponse {
     maxPlaylistItems: number;
   };
   openAIReady: boolean;
+  voiceCloneReady?: boolean;
+  vietnameseVoiceReady?: boolean;
   nodeVersion: string;
   message: string;
 }
@@ -178,6 +180,8 @@ export type FileToolId =
   | 'strip-metadata'
   | 'image-metadata'
   | 'scan-document'
+  | 'ocr-translate'
+  | 'caption-image'
   | 'remove-background'
   | 'remove-object'
   | 'chroma-key'

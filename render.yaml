@@ -12,13 +12,17 @@ services:
     plan: free
     autoDeploy: true
     healthCheckPath: /api/health
-    # Optional: dockerBuildArgs let you skip heavy features on small plans.
-    # On free plan, set these to "0" to keep the image small + avoid OOM:
-    #   INSTALL_TORCH=0 INSTALL_DEMUCS=0 INSTALL_INPAINT=0 INSTALL_YOLO=0
-    #   INSTALL_REMBG=0 INSTALL_WHISPER=0
-    # dockerBuildArgs:
-    #   INSTALL_DEMUCS: "0"   # uncomment to skip stems audio (saves ~1 GB build)
-    #   INSTALL_INPAINT: "0"  # uncomment to skip LaMa/LDM (saves ~500 MB)
+    # Free plan (0.5 GB RAM): heavy AI is disabled at build to keep the image small
+    # and avoid runtime OOM. Core features still work: YouTube/TikTok MP4/MP3,
+    # PDF<->Word (text), image tools, Excel, scan-document, OCR+translate, upscale.
+    # To enable AI (rembg/whisper/YOLO/LaMa/demucs), move to Standard+ and flip these to "1".
+    dockerBuildArgs:
+      INSTALL_TORCH: "0"     # base for demucs/LaMa/YOLO
+      INSTALL_DEMUCS: "0"    # stems audio
+      INSTALL_INPAINT: "0"   # LaMa/LDM object removal
+      INSTALL_YOLO: "0"      # smart object detection
+      INSTALL_REMBG: "0"     # AI background removal
+      INSTALL_WHISPER: "0"   # local transcript
     envVars:
       - key: NODE_ENV
         value: production

@@ -429,7 +429,7 @@ export function humanizeYtdlpError(rawMessage: string): string {
     return 'URL không được yt-dlp hỗ trợ. Thử YouTube/TikTok/Facebook/Vimeo… (1800+ site).';
   }
   if (lower.includes('http error 403')) {
-    return 'YouTube từ chối request (403). Update yt-dlp: pip install -U yt-dlp, hoặc thử lại sau.';
+    return 'YouTube từ chối request (403). Thường do thiếu đăng nhập hoặc PO Token: bật cookies trình duyệt (đặt YTDLP_COOKIES_FROM_BROWSER=chrome khi chạy server), hoặc đợi vài phút rồi thử lại. Nếu vẫn lỗi, cập nhật yt-dlp: py -3.13 -m pip install -U yt-dlp.';
   }
   if (lower.includes('http error 404')) {
     return 'URL không tồn tại (404). Kiểm tra lại link.';

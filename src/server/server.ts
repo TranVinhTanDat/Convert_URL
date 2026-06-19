@@ -40,6 +40,8 @@ type FileTool =
   | 'strip-metadata'
   | 'image-metadata'
   | 'scan-document'
+  | 'ocr-translate'
+  | 'caption-image'
   | 'remove-background'
   | 'remove-object'
   | 'chroma-key'
@@ -73,6 +75,8 @@ const fileToolExtensions: Record<FileTool, string[]> = {
   'strip-metadata': imageExtensions,
   'image-metadata': imageExtensions,
   'scan-document': imageExtensions,
+  'ocr-translate': imageExtensions,
+  'caption-image': imageExtensions,
   'remove-background': imageExtensions,
   'remove-object': imageExtensions,
   'chroma-key': imageExtensions,
@@ -386,6 +390,15 @@ function resolveYtdlpCookiesPath() {
     return directPath;
   }
 
+  // Zero-config local cookies: drop a Netscape-format cookies.txt at one of these
+  // paths (no env var needed) and it is used automatically. `secrets/` is gitignored.
+  for (const candidate of [
+    path.join(ROOT, 'secrets', 'youtube-cookies.txt'),
+    path.join(ROOT, 'youtube-cookies.txt')
+  ]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
   const rawBase64 = String(process.env.YTDLP_COOKIES_BASE64 || process.env.YOUTUBE_COOKIES_BASE64 || '').trim();
   const rawContent = String(process.env.YTDLP_COOKIES_CONTENT || process.env.YOUTUBE_COOKIES_CONTENT || '').trim();
   if (!rawBase64 && !rawContent) {
@@ -419,6 +432,15 @@ function ytdlpAuthArgs() {
   }
 
   return args;
+}
+
+// YouTube player clients used to fetch streams. The `ios` client now requires a
+// GVS PO Token and yields HTTP 403 on the actual data download, so it is excluded
+// by default. `web_safari` + `tv` are the most reliable PO-token-free clients as of
+// mid-2026. Override via YTDLP_PLAYER_CLIENT if YouTube shifts again.
+function youtubeExtractorArgs() {
+  const clients = String(process.env.YTDLP_PLAYER_CLIENT || 'default,web_safari,tv').trim();
+  return ['--extractor-args', `youtube:player_client=${clients}`];
 }
 
 async function hasYtdlp() {
@@ -488,7 +510,7 @@ function uniquePathInDir(jobDir: string, name: string): string {
 
 export type ToolOptions = Record<string, string | number | boolean>;
 
-function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTool; files: UploadedFile[]; options: ToolOptions; jobDir: string; id: string }> {
+function parseMultipartUpload(req: http.IncomingMessage, parseOpts: { validateTool?: boolean } = {}): Promise<{ tool: FileTool; files: UploadedFile[]; options: ToolOptions; jobDir: string; id: string }> {
   return new Promise((resolve, reject) => {
     const contentType = req.headers['content-type'];
     if (!contentType?.includes('multipart/form-data')) {
@@ -559,7 +581,7 @@ function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTo
         return;
       }
 
-      if (!tool || !isFileTool(tool)) {
+      if (parseOpts.validateTool !== false && (!tool || !isFileTool(tool))) {
         fs.rmSync(jobDir, { recursive: true, force: true });
         reject(new Error('Unsupported file tool.'));
         return;
@@ -571,13 +593,15 @@ function parseMultipartUpload(req: http.IncomingMessage): Promise<{ tool: FileTo
         return;
       }
 
-      const allowed = fileToolExtensions[tool];
-      const invalid = files.find((file) => !allowed.includes(path.extname(file.filePath).toLowerCase()));
-      if (invalid) {
-        fs.rmSync(jobDir, { recursive: true, force: true });
-        const extension = path.extname(invalid.filePath).toLowerCase().replace('.', '') || 'unknown';
-        reject(new Error(`File "${invalid.originalName}" (.${extension}) is not valid for this tool. Accepted: ${allowed.join(', ')}.`));
-        return;
+      if (parseOpts.validateTool !== false) {
+        const allowed = fileToolExtensions[tool];
+        const invalid = files.find((file) => !allowed.includes(path.extname(file.filePath).toLowerCase()));
+        if (invalid) {
+          fs.rmSync(jobDir, { recursive: true, force: true });
+          const extension = path.extname(invalid.filePath).toLowerCase().replace('.', '') || 'unknown';
+          reject(new Error(`File "${invalid.originalName}" (.${extension}) is not valid for this tool. Accepted: ${allowed.join(', ')}.`));
+          return;
+        }
       }
 
       resolve({ tool, files, options, jobDir, id });
@@ -1550,22 +1574,51 @@ async function resizeImage(inputPath: string, outputPath: string, options: ToolO
     .toFile(outputPath);
 }
 
-async function upscaleImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
-  const metadata = await sharp(inputPath, { failOn: 'none' }).metadata();
-  if (!metadata.width || !metadata.height) throw new Error('Cannot read image dimensions.');
-
-  const scaleLabel = pickString(options.scale, ['2x', '3x', '4x'] as const, '2x');
-  const scale = scaleLabel === '4x' ? 4 : scaleLabel === '3x' ? 3 : 2;
+async function upscaleLanczos(inputPath: string, outputPath: string, width: number, height: number, scale: number) {
   await imagePipeline(inputPath)
     .resize({
-      width: Math.min(metadata.width * scale, 6000),
-      height: Math.min(metadata.height * scale, 6000),
+      width: Math.min(width * scale, 6000),
+      height: Math.min(height * scale, 6000),
       fit: 'inside',
       kernel: sharp.kernel.lanczos3
     })
     .sharpen({ sigma: 1, m1: 1.1, m2: 1.6 })
     .png({ compressionLevel: 9 })
     .toFile(outputPath);
+}
+
+// AI super-resolution via OpenCV dnn_superres (learned EDSR/ESPCN/FSRCNN models).
+// Falls back to lanczos when cv2 is unavailable, the image is too large for CPU SR,
+// or the model run fails — so the tool always returns a result.
+async function upscaleImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const metadata = await sharp(inputPath, { failOn: 'none' }).metadata();
+  if (!metadata.width || !metadata.height) throw new Error('Cannot read image dimensions.');
+
+  const scaleLabel = pickString(options.scale, ['2x', '3x', '4x'] as const, '2x');
+  const scale = scaleLabel === '4x' ? 4 : scaleLabel === '3x' ? 3 : 2;
+  const model = pickString(options.srModel, ['espcn', 'fsrcnn', 'edsr'] as const, 'espcn');
+
+  const pixels = metadata.width * metadata.height;
+  // EDSR is heavy on CPU; cap it hard. ESPCN/FSRCNN are light and handle bigger inputs.
+  const maxPixels = model === 'edsr' ? 800_000 : 3_000_000;
+  const scanScript = path.join(ROOT, 'scripts', 'upscale.py');
+  const pythonCmd = pixels <= maxPixels && fs.existsSync(scanScript) ? await findPythonWithCv2() : null;
+
+  if (pythonCmd) {
+    try {
+      await run(pythonCmd, [
+        scanScript, inputPath, outputPath,
+        '--scale', String(scale),
+        '--model', model,
+        '--models-dir', path.join(ROOT, 'data', 'sr-models')
+      ], { timeoutMs: 5 * 60 * 1000 });
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 200) return;
+    } catch {
+      /* fall through to lanczos */
+    }
+  }
+
+  await upscaleLanczos(inputPath, outputPath, metadata.width, metadata.height, scale);
 }
 
 async function squareThumbnail(inputPath: string, outputPath: string, options: ToolOptions = {}) {
@@ -1673,16 +1726,191 @@ async function pdfToPng(inputPath: string, jobDir: string, options: ToolOptions 
   }
 }
 
-async function scanDocument(inputPath: string, outputPath: string) {
-  await imagePipeline(inputPath)
-    .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
-    .grayscale()
-    .normalise()
-    .median(1)
-    .sharpen({ sigma: 1.1, m1: 1.4, m2: 2.2 })
-    .threshold(188)
-    .png({ compressionLevel: 9 })
-    .toFile(outputPath);
+// Translate text via the free MyMemory API (no key). It caps each request at
+// ~500 chars, so we split on sentence/line boundaries and join the results.
+async function translateText(text: string, fromLang: string, toLang: string): Promise<string> {
+  const chunks: string[] = [];
+  let current = '';
+  for (const piece of text.split(/(?<=[.!?。\n])\s+/)) {
+    if ((current + ' ' + piece).trim().length > 480) {
+      if (current.trim()) chunks.push(current.trim());
+      current = piece;
+    } else {
+      current = current ? `${current} ${piece}` : piece;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  const out: string[] = [];
+  for (const chunk of chunks) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${encodeURIComponent(fromLang)}|${encodeURIComponent(toLang)}`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      const data = await res.json() as { responseData?: { translatedText?: string }; responseStatus?: number | string };
+      const translated = data?.responseData?.translatedText;
+      const status = Number(data?.responseStatus);
+      out.push(translated && status === 200 ? translated : chunk);
+    } catch {
+      out.push(chunk); // keep source on failure so nothing is lost
+    }
+  }
+  return out.join(' ');
+}
+
+// OCR an image with tesseract, then translate the extracted text. Produces a
+// bilingual Markdown file (source + translation side by side).
+async function ocrTranslate(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const tesseract = await findTesseractCommand();
+  if (!tesseract) {
+    throw new Error('OCR cần Tesseract. Cài: winget install UB-Mannheim.TesseractOCR (kèm gói tiếng Việt).');
+  }
+  const ocrLang = pickString(options.ocrLang, ['vie+eng', 'eng', 'vie'] as const, 'vie+eng');
+  const targetLang = pickString(options.targetLang, ['vi', 'en'] as const, 'vi');
+  const sourceLang = pickString(options.sourceLang, ['auto', 'en', 'vi'] as const, 'auto');
+
+  const { stdout } = await run(tesseract, [inputPath, 'stdout', '-l', ocrLang], { timeoutMs: 120000 });
+  const sourceText = stdout.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  if (!sourceText) {
+    throw new Error('Không nhận diện được chữ trong ảnh — thử ảnh rõ nét hơn hoặc đổi ngôn ngữ OCR.');
+  }
+
+  // MyMemory needs a concrete source lang; infer from OCR setting when "auto".
+  const from = sourceLang !== 'auto' ? sourceLang : (targetLang === 'vi' ? 'en' : 'vi');
+  const translated = await translateText(sourceText, from, targetLang);
+
+  const langName: Record<string, string> = { vi: 'Tiếng Việt', en: 'English' };
+  const md =
+`# OCR & Dịch thuật
+
+**Nguồn (${from === 'vi' ? 'Tiếng Việt' : 'English'}):**
+
+${sourceText}
+
+---
+
+**Bản dịch (${langName[targetLang]}):**
+
+${translated}
+`;
+  fs.writeFileSync(outputPath, md, 'utf8');
+}
+
+// Generate a caption / alt-text / product description for an image using an
+// OpenAI vision model. Requires OPENAI_API_KEY; outputs a Markdown file.
+async function captionImage(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
+  if (!apiKey) {
+    throw new Error('Tạo mô tả ảnh cần OPENAI_API_KEY. Đặt biến môi trường rồi khởi động lại server (set OPENAI_API_KEY=sk-...).');
+  }
+  const mode = pickString(options.captionMode, ['alt', 'describe', 'product'] as const, 'describe');
+  const lang = pickString(options.captionLang, ['vi', 'en'] as const, 'vi');
+  const model = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini');
+
+  // Downscale to keep the request small and cheap; vision models don't need full res.
+  const jpegBuffer = await sharp(inputPath, { failOn: 'none' })
+    .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 82 })
+    .toBuffer();
+  const dataUrl = `data:image/jpeg;base64,${jpegBuffer.toString('base64')}`;
+
+  const langWord = lang === 'vi' ? 'tiếng Việt' : 'English';
+  const prompts: Record<typeof mode, string> = {
+    alt: `Viết alt-text SEO ngắn gọn (tối đa 125 ký tự) bằng ${langWord} mô tả ảnh này. Chỉ trả về alt-text, không giải thích.`,
+    describe: `Mô tả chi tiết nội dung ảnh này bằng ${langWord}: chủ thể, bối cảnh, màu sắc, tâm trạng. Viết 2-4 câu tự nhiên.`,
+    product: `Đây là ảnh sản phẩm e-commerce. Bằng ${langWord}, trả về Markdown gồm: tiêu đề sản phẩm, đoạn mô tả bán hàng 2-3 câu, và danh sách thuộc tính (màu sắc, chất liệu, kiểu dáng nếu nhận ra được).`
+  };
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      max_tokens: 600,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: prompts[mode] },
+          { type: 'image_url', image_url: { url: dataUrl } }
+        ]
+      }]
+    }),
+    signal: AbortSignal.timeout(60000)
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`OpenAI API lỗi ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const caption = data?.choices?.[0]?.message?.content?.trim();
+  if (!caption) {
+    throw new Error('OpenAI không trả về nội dung mô tả.');
+  }
+
+  const titleByMode: Record<typeof mode, string> = {
+    alt: 'Alt-text SEO', describe: 'Mô tả ảnh', product: 'Mô tả sản phẩm'
+  };
+  const md = `# ${titleByMode[mode]}\n\n_Ảnh: ${path.basename(inputPath)} · model: ${model}_\n\n${caption}\n`;
+  fs.writeFileSync(outputPath, md, 'utf8');
+}
+
+// Python from the isolated .venv-tts (Coqui XTTS lives there so its pinned deps
+// don't clash with the main ML stack). Returns null if the venv isn't set up.
+function resolveTtsPython(): string | null {
+  const candidates = [
+    path.join(ROOT, '.venv-tts', 'Scripts', 'python.exe'),
+    path.join(ROOT, '.venv-tts', 'bin', 'python')
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
+// Optional fine-tuned XTTS checkpoint dir (e.g. viXTTS for Vietnamese). Used when
+// it contains config.json + model.pth; otherwise the default multilingual XTTS-v2 runs.
+function resolveVixttsDir(): string | null {
+  const dir = String(process.env.VIXTTS_DIR || '').trim() || path.join(ROOT, 'data', 'vixtts');
+  return fs.existsSync(path.join(dir, 'config.json')) && fs.existsSync(path.join(dir, 'model.pth')) ? dir : null;
+}
+
+async function findPythonWithCv2(): Promise<string | null> {
+  for (const candidate of ['python', 'python3', 'py']) {
+    if (!(await hasCommand(candidate, ['--version']))) continue;
+    if (await hasCommand(candidate, ['-c', 'import cv2'])) return candidate;
+  }
+  return null;
+}
+
+// CamScanner-style scan: opencv detects the document, perspective-warps it flat,
+// deskews, then applies the chosen output mode. Falls back to a sharp threshold
+// pipeline when no Python+cv2 is available so the tool always produces something.
+async function scanDocument(inputPath: string, outputPath: string, options: ToolOptions = {}) {
+  const mode = pickString(options.scanMode, ['color', 'gray', 'bw'] as const, 'bw');
+  const autoCrop = String(options.autoCrop ?? 'true') !== 'false';
+  const scanScript = path.join(ROOT, 'scripts', 'scan_document.py');
+  const pythonCmd = fs.existsSync(scanScript) ? await findPythonWithCv2() : null;
+
+  if (pythonCmd) {
+    const args = [scanScript, inputPath, outputPath, '--mode', mode];
+    if (!autoCrop) args.push('--no-crop');
+    try {
+      await run(pythonCmd, args, { timeoutMs: 120000 });
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 200) return;
+    } catch {
+      /* fall through to sharp fallback */
+    }
+  }
+
+  // Fallback: no cv2 — basic enhance/threshold with sharp (no perspective correction).
+  let pipeline = imagePipeline(inputPath)
+    .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true });
+  if (mode === 'color') {
+    pipeline = pipeline.normalise().sharpen({ sigma: 1.0, m1: 1.2, m2: 1.8 });
+  } else if (mode === 'gray') {
+    pipeline = pipeline.grayscale().normalise().sharpen({ sigma: 1.1, m1: 1.3, m2: 2.0 });
+  } else {
+    pipeline = pipeline.grayscale().normalise().median(1)
+      .sharpen({ sigma: 1.1, m1: 1.4, m2: 2.2 }).threshold(188);
+  }
+  await pipeline.png({ compressionLevel: 9 }).toFile(outputPath);
 }
 
 async function removeBackground(inputPath: string, outputPath: string, options: ToolOptions = {}) {
@@ -2286,7 +2514,17 @@ async function processFileConversion(tool: FileTool, inputPath: string, jobDir: 
     }
     case 'scan-document': {
       const outputPath = out('-scan', 'png');
-      await scanDocument(inputPath, outputPath);
+      await scanDocument(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'ocr-translate': {
+      const outputPath = out('-ocr-translate', 'md');
+      await ocrTranslate(inputPath, outputPath, options);
+      return outputPath;
+    }
+    case 'caption-image': {
+      const outputPath = out('-caption', 'md');
+      await captionImage(inputPath, outputPath, options);
       return outputPath;
     }
     case 'remove-background': {
@@ -2983,22 +3221,25 @@ async function processJob(job: ConvertJob) {
     if (!host) {
       throw new Error('URL is not supported. Use a YouTube, YouTube Music, or TikTok link.');
     }
+    const isYouTube = host.includes('youtu');
 
     updateJob(job, { progress: 6, step: `Preparing ${job.options.format.toUpperCase()} job` });
 
     const args = [
       '--encoding',
       'utf-8',
-      '--js-runtimes',
-      'node',
-      '--remote-components',
-      'ejs:github',
-      '--extractor-args',
-      'youtube:player_client=default,ios,web',
+      // The node JS runtime + remote EJS solver are for YouTube's n-signature
+      // challenge. They BREAK TikTok's challenge extraction ("Unable to extract
+      // universal data for rehydration"), so apply them only for YouTube.
+      ...(isYouTube
+        ? ['--js-runtimes', 'node', '--remote-components', 'ejs:github', ...youtubeExtractorArgs()]
+        : []),
       '--retries',
-      '3',
+      '10',
       '--fragment-retries',
-      '3',
+      '10',
+      '--retry-sleep',
+      'fragment:exp=1:20',
       ...ytdlpAuthArgs(),
       '--windows-filenames',
       '--no-mtime',
@@ -3170,6 +3411,8 @@ const server = http.createServer(async (req, res) => {
           maxPlaylistItems: PUBLIC_MAX_PLAYLIST_ITEMS
         },
         openAIReady: Boolean(process.env.OPENAI_API_KEY),
+        voiceCloneReady: Boolean(resolveTtsPython()),
+        vietnameseVoiceReady: Boolean(resolveVixttsDir()),
         nodeVersion: process.version,
         message: ytdlpReady && ffmpegReady && ffprobeReady ? 'Ready' : 'Missing required tools'
       });
@@ -3270,6 +3513,79 @@ const server = http.createServer(async (req, res) => {
         const status = code === 'DEMUCS_NOT_INSTALLED' ? 503 : 502;
         console.error('[stems] error:', raw.slice(0, 500));
         sendJson(res, status, { error: humanizeYtdlpError(raw), rawError: raw.slice(0, 800), code });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/voice-clone') {
+      const upload = await parseMultipartUpload(req, { validateTool: false });
+      const cleanup = () => fs.rmSync(upload.jobDir, { recursive: true, force: true });
+      if (!upload.files.length) {
+        cleanup();
+        sendJson(res, 400, { error: 'Cần upload 1 file giọng mẫu (audio) để nhân bản.' });
+        return;
+      }
+      const text = String(upload.options.text || '').trim();
+      if (!text) {
+        cleanup();
+        sendJson(res, 400, { error: 'Cần nhập nội dung cần đọc (text).' });
+        return;
+      }
+      if (text.length > 1000) {
+        cleanup();
+        sendJson(res, 400, { error: 'Nội dung quá dài (tối đa 1000 ký tự cho mỗi lần tạo).' });
+        return;
+      }
+      const lang = pickString(upload.options.lang,
+        ['vi', 'en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'ru', 'nl', 'ja', 'zh-cn', 'ko'] as const, 'en');
+
+      const ttsPython = resolveTtsPython();
+      const cloneScript = path.join(ROOT, 'scripts', 'voice_clone.py');
+      if (!ttsPython || !fs.existsSync(cloneScript)) {
+        cleanup();
+        sendJson(res, 503, {
+          error: 'Engine nhân bản giọng (Coqui XTTS) chưa được cài. Tạo venv .venv-tts và "pip install coqui-tts".',
+          code: 'TTS_NOT_INSTALLED'
+        });
+        return;
+      }
+
+      const vixttsDir = resolveVixttsDir();
+      if (lang === 'vi' && !vixttsDir) {
+        cleanup();
+        sendJson(res, 400, {
+          error: 'XTTS-v2 mặc định không hỗ trợ tiếng Việt. Tải model viXTTS vào data/vixtts (config.json + model.pth + vocab.json) hoặc chọn ngôn ngữ khác.',
+          code: 'VI_MODEL_MISSING'
+        });
+        return;
+      }
+
+      try {
+        // Normalize the reference sample to mono 22.05kHz WAV for stable cloning.
+        const refWav = path.join(upload.jobDir, 'reference.wav');
+        await run('ffmpeg', ['-y', '-i', upload.files[0].filePath, '-ac', '1', '-ar', '22050', refWav], { timeoutMs: 60000 });
+
+        const outWav = path.join(upload.jobDir, 'voice-clone.wav');
+        const args = [cloneScript, refWav, text, outWav, '--lang', lang];
+        if (vixttsDir) args.push('--model-dir', vixttsDir);
+        await run(ttsPython, args, {
+          timeoutMs: 12 * 60 * 1000,
+          env: { ...process.env, COQUI_TOS_AGREED: '1' }
+        });
+
+        if (!fs.existsSync(outWav) || fs.statSync(outWav).size < 200) {
+          throw new Error('Engine không tạo được audio.');
+        }
+        sendJson(res, 200, {
+          id: upload.id,
+          status: 'completed',
+          files: [fileToDownload(upload.id, outWav)]
+        });
+      } catch (error) {
+        cleanup();
+        const raw = error instanceof Error ? error.message : 'Nhân bản giọng thất bại.';
+        console.error('[voice-clone] error:', raw.slice(0, 500));
+        sendJson(res, 502, { error: raw.slice(0, 300) });
       }
       return;
     }

@@ -17,8 +17,10 @@ RUN apt-get update \
 
 # ===== LAYER 2: Lightweight pip deps (~300 MB) — always installed =====
 # yt-dlp, pdf2docx, OCR stack, OpenCV w/ xphoto (xoá vật thể fallback)
+# curl_cffi: enables yt-dlp browser impersonation — REQUIRED for TikTok downloads
+# (without it: "Unable to extract universal data for rehydration").
 RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade \
-      yt-dlp pdf2docx pymupdf pytesseract pillow python-docx \
+      yt-dlp curl_cffi pdf2docx pymupdf pytesseract pillow python-docx \
       opencv-contrib-python-headless ocrmypdf \
   && python3 -m yt_dlp --version \
   && pdf2docx --help >/dev/null \

@@ -56,6 +56,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   approveArticle,
+  cloneVoice,
   convertFile,
   convertFiles,
   createJob,
@@ -225,10 +226,10 @@ const fileTools: FileTool[] = [
   },
   {
     id: 'upscale-image',
-    title: 'Upscale 2x',
-    description: 'Phóng ảnh 2x bằng Lanczos + làm nét nhẹ, hợp ảnh nhỏ cần rõ hơn.',
+    title: 'Upscale AI',
+    description: 'Phóng ảnh 2x/3x/4x bằng AI super-resolution (EDSR/ESPCN/FSRCNN qua OpenCV), nét hơn hẳn phóng thường. Tự fallback Lanczos cho ảnh lớn.',
     accept: 'image/*',
-    badge: 'Image'
+    badge: 'AI'
   },
   {
     id: 'square-thumbnail',
@@ -254,7 +255,7 @@ const fileTools: FileTool[] = [
   {
     id: 'scan-document',
     title: 'Scan tài liệu',
-    description: 'Làm sạch ảnh chụp giấy tờ: xoay theo metadata, xám hóa, tăng tương phản, làm nét và xuất PNG.',
+    description: 'Quét giấy tờ kiểu CamScanner: tự phát hiện mép giấy, nắn phối cảnh phẳng, deskew và xuất bản scan đen-trắng/xám/màu sạch nét.',
     accept: 'image/*',
     badge: 'Scan'
   },
@@ -265,6 +266,20 @@ const fileTools: FileTool[] = [
     accept: 'image/*',
     badge: 'AI',
     needsRembg: true
+  },
+  {
+    id: 'ocr-translate',
+    title: 'OCR & Dịch thuật',
+    description: 'Nhận diện chữ trong ảnh bằng Tesseract (tiếng Việt có dấu) rồi dịch Anh↔Việt, xuất file Markdown song ngữ.',
+    accept: 'image/*',
+    badge: 'AI'
+  },
+  {
+    id: 'caption-image',
+    title: 'Tạo mô tả ảnh (AI)',
+    description: 'Sinh alt-text SEO, mô tả chi tiết hoặc mô tả sản phẩm e-commerce bằng AI vision (cần OPENAI_API_KEY). Xuất Markdown.',
+    accept: 'image/*',
+    badge: 'AI'
   },
   {
     id: 'chroma-key',
@@ -319,6 +334,92 @@ type OptionField =
   | { type: 'text'; key: string; label: string; help?: string; placeholder?: string; defaultValue: string };
 
 const toolOptionSpec: Partial<Record<FileToolId, OptionField[]>> = {
+  'caption-image': [
+    {
+      type: 'select',
+      key: 'captionMode',
+      label: 'Kiểu mô tả',
+      defaultValue: 'describe',
+      help: 'Alt-text: ngắn cho SEO/accessibility. Mô tả: 2-4 câu chi tiết. Sản phẩm: tiêu đề + bán hàng + thuộc tính.',
+      options: [
+        { value: 'describe', label: 'Mô tả chi tiết' },
+        { value: 'alt', label: 'Alt-text SEO (ngắn)' },
+        { value: 'product', label: 'Mô tả sản phẩm (e-commerce)' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'captionLang',
+      label: 'Ngôn ngữ',
+      defaultValue: 'vi',
+      options: [
+        { value: 'vi', label: 'Tiếng Việt' },
+        { value: 'en', label: 'English' }
+      ]
+    }
+  ],
+  'ocr-translate': [
+    {
+      type: 'select',
+      key: 'ocrLang',
+      label: 'Ngôn ngữ OCR',
+      defaultValue: 'vie+eng',
+      help: 'Ngôn ngữ chữ trong ảnh để Tesseract nhận diện.',
+      options: [
+        { value: 'vie+eng', label: 'Việt + Anh' },
+        { value: 'eng', label: 'Anh' },
+        { value: 'vie', label: 'Việt' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'targetLang',
+      label: 'Dịch sang',
+      defaultValue: 'vi',
+      help: 'Ngôn ngữ đích của bản dịch.',
+      options: [
+        { value: 'vi', label: 'Tiếng Việt' },
+        { value: 'en', label: 'English' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'sourceLang',
+      label: 'Ngôn ngữ nguồn',
+      defaultValue: 'auto',
+      help: 'Auto: suy ra từ ngôn ngữ đích (vd dịch sang Việt thì coi nguồn là Anh).',
+      options: [
+        { value: 'auto', label: 'Tự động' },
+        { value: 'en', label: 'English' },
+        { value: 'vi', label: 'Tiếng Việt' }
+      ]
+    }
+  ],
+  'scan-document': [
+    {
+      type: 'select',
+      key: 'scanMode',
+      label: 'Kiểu xuất',
+      defaultValue: 'bw',
+      help: 'Đen-trắng cho văn bản (rõ chữ, file nhẹ); Xám giữ sắc độ; Màu cho ảnh/CMND/hoá đơn có màu.',
+      options: [
+        { value: 'bw', label: 'Đen-trắng (văn bản)' },
+        { value: 'gray', label: 'Xám' },
+        { value: 'color', label: 'Màu (cân bằng trắng + tương phản)' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'autoCrop',
+      label: 'Tự nắn phối cảnh',
+      defaultValue: 'true',
+      help: 'Tự dò 4 góc tờ giấy và nắn phẳng. Tắt nếu ảnh đã là tài liệu phẳng (chỉ tăng tương phản).',
+      options: [
+        { value: 'true', label: 'Bật (phát hiện mép giấy)' },
+        { value: 'false', label: 'Tắt (giữ nguyên khung)' }
+      ]
+    }
+  ],
   'pdf-to-word': [
     {
       type: 'select',
@@ -419,6 +520,18 @@ const toolOptionSpec: Partial<Record<FileToolId, OptionField[]>> = {
         { value: '2x', label: '2x (mặc định)' },
         { value: '3x', label: '3x' },
         { value: '4x', label: '4x (giới hạn cạnh 6000px)' }
+      ]
+    },
+    {
+      type: 'select',
+      key: 'srModel',
+      label: 'Model AI',
+      defaultValue: 'espcn',
+      help: 'ESPCN nhanh & cân bằng; FSRCNN nhanh nhất; EDSR nét nhất nhưng chậm (chỉ ảnh nhỏ ≤0.8MP). Ảnh lớn tự fallback Lanczos.',
+      options: [
+        { value: 'espcn', label: 'ESPCN (nhanh, cân bằng)' },
+        { value: 'fsrcnn', label: 'FSRCNN (nhanh nhất)' },
+        { value: 'edsr', label: 'EDSR (nét nhất, chậm)' }
       ]
     }
   ],
@@ -1251,66 +1364,64 @@ const aiLabCards: AILabCard[] = [
   {
     id: 'caption',
     title: 'Tạo mô tả ảnh',
-    description: 'Sinh caption tự động + alt-text cho ảnh sản phẩm bằng AI vision. Đang phát triển.',
-    longDescription: 'Sẽ dùng vision LLM local (LLaVA / Florence-2) để mô tả ảnh, phục vụ alt-text SEO, mô tả sản phẩm e-commerce, accessibility. Output Markdown + JSON structured.',
-    tag: 'AI · Soon',
+    description: 'Sinh alt-text SEO, mô tả chi tiết hoặc mô tả sản phẩm e-commerce bằng AI vision (cần OPENAI_API_KEY).',
+    longDescription: 'Dùng OpenAI vision (gpt-4o-mini) mô tả ảnh: 3 chế độ — alt-text SEO ngắn, mô tả chi tiết 2-4 câu, hoặc mô tả sản phẩm (tiêu đề + bán hàng + thuộc tính). Hỗ trợ tiếng Việt / English, xuất Markdown. Cần đặt biến môi trường OPENAI_API_KEY.',
+    tag: 'AI · Vision',
     category: 'image',
     accent: 'peach',
     icon: 'languages',
     preview: 'text',
-    available: false,
-    comingSoon: 'Q3 2026',
+    action: { tool: 'caption-image', group: 'images', label: 'Mở Tạo mô tả' },
+    available: true,
     formats: ['JPG', 'PNG'],
     processTime: '~5-8s',
     maxSize: '10 MB',
     tips: [
       'Alt-text auto giúp SEO + accessibility',
-      'Đang chọn model: LLaVA 1.6 hay Florence-2',
-      'Sẽ có chế độ "sản phẩm e-commerce" với giá / màu / chất liệu'
+      'Chế độ "sản phẩm" trả tiêu đề + thuộc tính (màu, chất liệu)',
+      'Cần OPENAI_API_KEY — đặt env rồi khởi động lại server'
     ],
     relatedIds: ['ocr-translate', 'remove-bg']
   },
   {
     id: 'ocr-translate',
     title: 'OCR & Dịch thuật',
-    description: 'Nhận diện chữ trong ảnh và dịch song ngữ Anh — Việt. Sắp ra mắt cuối năm.',
-    longDescription: 'OCR bằng PaddleOCR (Vietnamese accurate) → text extraction → fallback dịch via local LLM hoặc Google Translate API. Output side-by-side EN/VI.',
-    tag: 'OCR · Soon',
+    description: 'Nhận diện chữ trong ảnh bằng Tesseract (tiếng Việt có dấu) rồi dịch Anh↔Việt, xuất Markdown song ngữ.',
+    longDescription: 'OCR bằng Tesseract (vie+eng) → trích text → dịch qua MyMemory API (miễn phí, không cần key). Xuất file Markdown gồm bản gốc + bản dịch. Chọn ngôn ngữ OCR, hướng dịch (Anh→Việt hoặc Việt→Anh).',
+    tag: 'OCR · Dịch',
     category: 'document',
     accent: 'sky',
     icon: 'languages',
     preview: 'bilingual',
-    available: false,
-    comingSoon: 'Q3 2026',
-    formats: ['JPG', 'PNG', 'PDF'],
+    action: { tool: 'ocr-translate', group: 'images', label: 'Mở OCR & Dịch' },
+    available: true,
+    formats: ['JPG', 'PNG'],
     processTime: '~3-5s',
     maxSize: '15 MB',
     tips: [
-      'PaddleOCR hỗ trợ tiếng Việt có dấu',
+      'Tesseract hỗ trợ tiếng Việt có dấu (gói vie)',
       'Hợp tài liệu kỹ thuật / sách / menu nước ngoài',
-      'Sẽ có batch mode cho cả thư mục ảnh'
+      'Ảnh rõ nét → OCR chính xác hơn'
     ],
     relatedIds: ['caption', 'scan-doc']
   },
   {
     id: 'voice-clone',
     title: 'Nhân bản giọng nói',
-    description: 'Sao chép giọng đọc từ 30s mẫu, tạo voice over tiếng Việt tự nhiên. Premium beta.',
-    longDescription: 'XTTS-v2 / F5-TTS — clone giọng người bất kỳ từ 30s sample. Output WAV 24kHz. Yêu cầu sample sạch, không nhạc nền. Có thể chuyển giọng đa ngôn ngữ.',
-    tag: 'Audio · Premium',
+    description: 'Clone giọng từ 6-30s mẫu rồi đọc văn bản bất kỳ bằng Coqui XTTS-v2 (chạy local trên CPU).',
+    longDescription: 'XTTS-v2 clone giọng người bất kỳ từ vài giây sample, output WAV. Đa ngôn ngữ (en/es/fr/de/ja/zh/ko/ru...). Tiếng Việt cần model viXTTS bổ sung. Chạy local trên CPU nên mỗi câu mất ~30-90s.',
+    tag: 'Audio · XTTS',
     category: 'audio',
     accent: 'peach',
     icon: 'volume',
     preview: 'voicewave',
-    available: false,
-    comingSoon: 'Premium',
-    premium: true,
+    available: true,
     formats: ['WAV', 'MP3'],
-    processTime: '~10-20s',
+    processTime: '~30-90s (CPU)',
     maxSize: '5 MB sample',
     tips: [
-      'Sample sạch (không nhạc) cho output tự nhiên nhất',
-      'Premium vì cần GPU ≥ 8GB VRAM',
+      'Sample sạch (không nhạc nền) cho output tự nhiên nhất',
+      'Tiếng Việt: cần tải model viXTTS vào data/vixtts',
       'Tuyệt đối không clone giọng người khác trái phép'
     ],
     relatedIds: ['whisper', 'caption']
@@ -1587,6 +1698,13 @@ export function App() {
   const [labStemsMuted, setLabStemsMuted] = useState<Record<string, boolean>>({ vocals: false, drums: false, bass: false, other: false });
   const [labStemsSolo, setLabStemsSolo] = useState<string | null>(null);
   const labStemsAudioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  // Voice clone (XTTS) workspace
+  const [labVcSample, setLabVcSample] = useState<File | null>(null);
+  const [labVcText, setLabVcText] = useState('');
+  const [labVcLang, setLabVcLang] = useState('en');
+  const [labVcBusy, setLabVcBusy] = useState(false);
+  const [labVcError, setLabVcError] = useState('');
+  const [labVcResult, setLabVcResult] = useState<ConvertFile | null>(null);
   // Object removal (Inpaint) workspace
   const [labInpaintMode, setLabInpaintMode] = useState<'smart' | 'subject' | 'manual'>('smart');
   // Smart object detection (YOLOv8)
@@ -2003,6 +2121,12 @@ export function App() {
 
   function openLabCard(card: AILabCard) {
     pushLabRecent(card.id);
+    // Text-output tools (Markdown) live in the Files tab, not the image workspace.
+    if ((card.id === 'caption' || card.id === 'ocr-translate') && card.action) {
+      openFileTool(card.action.tool, card.action.group);
+      pushToast({ variant: 'success', title: 'Đã mở công cụ', detail: card.title });
+      return;
+    }
     resetLabWorkspace();
     // Reset audio workspace state for whisper
     if (card.id === 'whisper') {
@@ -2011,6 +2135,13 @@ export function App() {
       setLabAudioResult(null);
       setLabAudioError('');
       setLabAudioView('segments');
+    }
+    // Reset voice clone workspace state
+    if (card.id === 'voice-clone') {
+      setLabVcSample(null);
+      setLabVcText('');
+      setLabVcResult(null);
+      setLabVcError('');
     }
     // Reset inpaint state. Default to Smart (YOLO) detect — keep main, remove secondary.
     if (card.id === 'remove-object') {
@@ -2029,6 +2160,26 @@ export function App() {
       setLabWsOptions({});
     }
     setLabView('workspace');
+  }
+
+  async function runVoiceClone() {
+    if (!labVcSample) { setLabVcError('Cần upload 1 file giọng mẫu (audio).'); return; }
+    if (!labVcText.trim()) { setLabVcError('Cần nhập nội dung cần đọc.'); return; }
+    setLabVcBusy(true);
+    setLabVcError('');
+    setLabVcResult(null);
+    try {
+      const result = await cloneVoice(labVcSample, labVcText.trim(), labVcLang);
+      if (!result.files.length) throw new Error('Không có audio trả về.');
+      setLabVcResult(result.files[0]);
+      pushToast({ variant: 'success', title: 'Nhân bản giọng thành công', detail: 'Audio đã sẵn sàng tải về.' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Nhân bản giọng thất bại';
+      setLabVcError(msg);
+      pushToast({ variant: 'error', title: 'Nhân bản giọng thất bại', detail: msg });
+    } finally {
+      setLabVcBusy(false);
+    }
   }
 
   async function runAudioWorkspace() {
@@ -4801,6 +4952,82 @@ export function App() {
                     );
                   })()
                 )}
+              </section>
+            );
+          }
+
+          if (card.id === 'voice-clone') {
+            const vcLangs: Array<{ id: string; label: string }> = [
+              { id: 'en', label: 'English' }, { id: 'vi', label: 'Tiếng Việt (cần viXTTS)' },
+              { id: 'es', label: 'Español' }, { id: 'fr', label: 'Français' },
+              { id: 'de', label: 'Deutsch' }, { id: 'it', label: 'Italiano' },
+              { id: 'pt', label: 'Português' }, { id: 'ja', label: '日本語' },
+              { id: 'zh-cn', label: '中文' }, { id: 'ko', label: '한국어' }, { id: 'ru', label: 'Русский' }
+            ];
+            return (
+              <section className={`forge-labws accent-${card.accent}`}>
+                <header className="forge-labws-top">
+                  <button type="button" className="forge-labws-back" onClick={backToLabGrid}>
+                    <ArrowRight size={13} style={{ transform: 'rotate(180deg)' }} /> AI Lab
+                  </button>
+                  <div className="forge-labws-brand">
+                    <div className="forge-labws-brand-icon"><Icon size={16} /></div>
+                    <div><strong>{card.title}</strong><small>{card.tag}</small></div>
+                  </div>
+                  <div className="forge-labws-top-meta"><span><Clock size={11} /> {card.processTime}</span></div>
+                </header>
+                <div className="forge-labws-body" style={{ display: 'block', padding: '20px', maxWidth: 720, margin: '0 auto' }}>
+                  {health && !health.voiceCloneReady ? (
+                    <div className="forge-audio-empty" style={{ marginBottom: 16 }}>
+                      ⚠️ Engine nhân bản giọng (Coqui XTTS) chưa được cài trên server. Tạo venv <code>.venv-tts</code> và <code>pip install coqui-tts</code> + torch.
+                    </div>
+                  ) : null}
+
+                  <label className="forge-field-label" style={{ display: 'block', marginBottom: 6 }}>1. Giọng mẫu (audio 6-30s, càng sạch càng tốt)</label>
+                  <input type="file" accept="audio/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) { setLabVcSample(f); setLabVcError(''); } }} style={{ marginBottom: 4 }} />
+                  {labVcSample ? <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 14 }}>✓ {labVcSample.name}</div> : <div style={{ marginBottom: 14 }} />}
+
+                  <label className="forge-field-label" style={{ display: 'block', marginBottom: 6 }}>2. Nội dung cần đọc (≤ 1000 ký tự)</label>
+                  <textarea
+                    value={labVcText}
+                    maxLength={1000}
+                    onChange={(e) => setLabVcText(e.target.value)}
+                    placeholder="Nhập câu cần đọc bằng giọng đã clone..."
+                    rows={4}
+                    style={{ width: '100%', resize: 'vertical', marginBottom: 4, padding: 10, borderRadius: 8 }}
+                  />
+                  <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 14, textAlign: 'right' }}>{labVcText.length}/1000</div>
+
+                  <label className="forge-field-label" style={{ display: 'block', marginBottom: 6 }}>3. Ngôn ngữ</label>
+                  <select className="forge-select" value={labVcLang} onChange={(e) => setLabVcLang(e.target.value)} style={{ marginBottom: 18 }}>
+                    {vcLangs.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+                  </select>
+                  {labVcLang === 'vi' && health && !health.vietnameseVoiceReady ? (
+                    <div className="forge-audio-empty" style={{ marginBottom: 14 }}>
+                      ℹ️ XTTS-v2 mặc định không hỗ trợ tiếng Việt. Cần tải model <strong>viXTTS</strong> vào <code>data/vixtts</code> (config.json + model.pth + vocab.json).
+                    </div>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    className="forge-btn-primary"
+                    disabled={labVcBusy || !labVcSample || !labVcText.trim()}
+                    onClick={runVoiceClone}
+                    style={{ width: '100%', padding: '12px', fontSize: 15 }}
+                  >
+                    {labVcBusy ? '⏳ Đang tổng hợp (CPU, có thể 30-90s)...' : '🎙️ Nhân bản giọng & đọc'}
+                  </button>
+
+                  {labVcError ? <div className="forge-audio-empty" style={{ marginTop: 16, color: '#dc2626' }}>{labVcError}</div> : null}
+
+                  {labVcResult ? (
+                    <div style={{ marginTop: 20 }}>
+                      <div className="forge-field-label" style={{ marginBottom: 8 }}>Kết quả</div>
+                      <audio controls src={labVcResult.downloadUrl} style={{ width: '100%', marginBottom: 12 }} />
+                      <DownloadList files={[labVcResult]} />
+                    </div>
+                  ) : null}
+                </div>
               </section>
             );
           }

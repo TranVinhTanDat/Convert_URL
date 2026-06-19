@@ -2,6 +2,11 @@ node_modules/
 dist/
 downloads/
 tmp-test/
+secrets/
+youtube-cookies.txt
+data/sr-models/
+.venv-tts/
+data/vixtts/
 data/content-studio/news.json
 *.pt
 *.log

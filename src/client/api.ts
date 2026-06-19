@@ -144,6 +144,20 @@ export function separateStems(payload: { url: string; model?: string }): Promise
   });
 }
 
+export interface VoiceCloneResult {
+  id: string;
+  status: string;
+  files: import('./types').ConvertFile[];
+}
+
+export function cloneVoice(sample: File, text: string, lang: string): Promise<VoiceCloneResult> {
+  const body = new FormData();
+  body.append('tool', 'voice-clone');
+  body.append('options', JSON.stringify({ text, lang }));
+  body.append('file', sample, sample.name);
+  return request<VoiceCloneResult>('/api/voice-clone', { method: 'POST', body });
+}
+
 export function fetchTranscript(payload: { url: string; languages?: string[]; useWhisper?: boolean }): Promise<TranscriptResult> {
   return request<TranscriptResult>('/api/transcript', {
     method: 'POST',
