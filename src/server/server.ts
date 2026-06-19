@@ -3283,10 +3283,28 @@ async function processJob(job: ConvertJob) {
 
     const ytdlpRunner = await resolveYtdlpRunner();
     updateJob(job, { progress: 10, step: 'Starting yt-dlp' });
-    await run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], {
-      onStdout: (text) => parseYtdlpProgress(job, text),
-      onStderr: (text) => parseYtdlpProgress(job, text)
-    });
+    // TikTok's anti-bot intermittently serves a page without the rehydration data
+    // (~50% of requests). yt-dlp can't retry this internally, so retry the whole
+    // command for that specific transient error (YouTube doesn't need it).
+    const isTransientExtract = (m: string) => /rehydration|universal data/i.test(m);
+    const maxAttempts = isYouTube ? 1 : 4;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], {
+          onStdout: (text) => parseYtdlpProgress(job, text),
+          onStderr: (text) => parseYtdlpProgress(job, text)
+        });
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (attempt < maxAttempts && isTransientExtract(msg)) {
+          addLog(job, `Nguồn trả dữ liệu không đầy đủ, thử lại (${attempt + 1}/${maxAttempts})…`);
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+        throw err;
+      }
+    }
 
     let files = getJobFiles(job.jobDir);
     if (files.length === 0) {
