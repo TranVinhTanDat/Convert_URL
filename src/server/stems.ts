@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export interface StemFile {
-  name: 'vocals' | 'drums' | 'bass' | 'other';
+  name: 'vocals' | 'drums' | 'bass' | 'other' | 'instrumental';
   label: string;
   fileName: string;
   size: number;
@@ -41,6 +41,7 @@ interface StemsRunOptions {
   jobId: string;
   downloadsBase: string;
   model?: 'htdemucs' | 'htdemucs_ft' | 'mdx_extra' | 'spleeter:4stems';
+  twoStems?: boolean; // karaoke mode: vocals + instrumental only (≈2x faster)
   runYtdlp: (args: string[], options: { timeoutMs: number }) => Promise<{ stdout: string }>;
   runCommand: (command: string, args: string[], options?: { timeoutMs?: number; env?: Record<string, string> }) => Promise<{ stdout: string; stderr: string }>;
   hasCommand: (command: string, args: string[]) => Promise<boolean>;
@@ -96,6 +97,7 @@ async function fetchVideoInfo(url: string, runYtdlp: StemsRunOptions['runYtdlp']
 export async function separateStems(options: StemsRunOptions): Promise<StemsResult> {
   const { url, jobDir, jobId, downloadsBase, runYtdlp, runCommand, hasCommand } = options;
   const model = options.model || 'htdemucs';
+  const twoStems = Boolean(options.twoStems);
 
   // 1) Verify backend availability
   const demucsAvailable = await detectDemucs(hasCommand);
@@ -143,29 +145,23 @@ export async function separateStems(options: StemsRunOptions): Promise<StemsResu
   // demucs -n <model> --out <dir> --mp3 --device cpu <input>
   const demucsOutDir = path.join(jobDir, 'stems-raw');
   fs.mkdirSync(demucsOutDir, { recursive: true });
+  const demucsArgs = [
+    '-n', model,
+    '--out', demucsOutDir,
+    '--mp3',
+    '--mp3-bitrate', '256',
+    '--device', 'cpu',
+    ...(twoStems ? ['--two-stems', 'vocals'] : []),
+    audioPath
+  ];
   try {
-    await runCommand('demucs', [
-      '-n', model,
-      '--out', demucsOutDir,
-      '--mp3',
-      '--mp3-bitrate', '256',
-      '--device', 'cpu',
-      audioPath
-    ], { timeoutMs: 30 * 60 * 1000 }); // 30 min hard cap
+    await runCommand('demucs', demucsArgs, { timeoutMs: 30 * 60 * 1000 }); // 30 min hard cap
   } catch (err) {
     // Try python -m fallback
     const msg = err instanceof Error ? err.message : String(err);
     if (/ENOENT|not found|command not found/i.test(msg)) {
       const pythonCommand = (await hasCommand('python3', ['--version'])) ? 'python3' : 'python';
-      await runCommand(pythonCommand, [
-        '-m', 'demucs.separate',
-        '-n', model,
-        '--out', demucsOutDir,
-        '--mp3',
-        '--mp3-bitrate', '256',
-        '--device', 'cpu',
-        audioPath
-      ], { timeoutMs: 30 * 60 * 1000 });
+      await runCommand(pythonCommand, ['-m', 'demucs.separate', ...demucsArgs], { timeoutMs: 30 * 60 * 1000 });
     } else {
       throw err;
     }
@@ -182,27 +178,33 @@ export async function separateStems(options: StemsRunOptions): Promise<StemsResu
   }
   const stemFolder = path.join(modelDir, innerDirs[0]);
 
-  // 5) Move stems to public download folder
-  const stemNames: Array<'vocals' | 'drums' | 'bass' | 'other'> = ['vocals', 'drums', 'bass', 'other'];
-  const stemLabels: Record<typeof stemNames[number], string> = {
-    vocals: 'Vocals',
-    drums: 'Drums',
-    bass: 'Bass',
-    other: 'Other'
-  };
+  // 5) Move stems to public download folder. 2-stem mode (demucs --two-stems vocals)
+  // outputs vocals.mp3 + no_vocals.mp3; 4-stem outputs vocals/drums/bass/other.
+  type StemSpec = { file: string; name: StemFile['name']; label: string };
+  const stemSpecs: StemSpec[] = twoStems
+    ? [
+        { file: 'vocals', name: 'vocals', label: 'Giọng hát (Vocals)' },
+        { file: 'no_vocals', name: 'instrumental', label: 'Nhạc nền (Karaoke)' }
+      ]
+    : [
+        { file: 'vocals', name: 'vocals', label: 'Vocals' },
+        { file: 'drums', name: 'drums', label: 'Drums' },
+        { file: 'bass', name: 'bass', label: 'Bass' },
+        { file: 'other', name: 'other', label: 'Other' }
+      ];
   const stems: StemFile[] = [];
 
-  for (const stemName of stemNames) {
-    const srcPath = path.join(stemFolder, `${stemName}.mp3`);
+  for (const spec of stemSpecs) {
+    const srcPath = path.join(stemFolder, `${spec.file}.mp3`);
     if (!fs.existsSync(srcPath)) continue;
-    const targetName = `${stemName}.mp3`;
+    const targetName = `${spec.name}.mp3`;
     const targetPath = path.join(jobDir, targetName);
     fs.renameSync(srcPath, targetPath);
     const stat = fs.statSync(targetPath);
     const stemDur = await probeAudioDuration(targetPath, runCommand);
     stems.push({
-      name: stemName,
-      label: stemLabels[stemName],
+      name: spec.name,
+      label: spec.label,
       fileName: targetName,
       size: stat.size,
       duration: stemDur || duration,
@@ -215,28 +217,35 @@ export async function separateStems(options: StemsRunOptions): Promise<StemsResu
     throw new Error('Demucs xuất 0 stem — kiểm tra version hoặc thử model khác.');
   }
 
-  // 6) Build instrumental (karaoke) = drums + bass + other (no vocals) via ffmpeg amix
+  // 6) Karaoke/instrumental track
   let instrumentalUrl: string | null = null;
-  const nonVocal = stems.filter((s) => s.name !== 'vocals');
-  if (nonVocal.length >= 2) {
-    const inputs: string[] = [];
-    nonVocal.forEach((s) => {
-      inputs.push('-i', path.join(jobDir, s.fileName));
-    });
-    const instrumentalPath = path.join(jobDir, 'instrumental.mp3');
-    try {
-      await runCommand('ffmpeg', [
-        '-y',
-        ...inputs,
-        '-filter_complex', `amix=inputs=${nonVocal.length}:duration=longest:normalize=0`,
-        '-b:a', '256k',
-        instrumentalPath
-      ], { timeoutMs: 120000 });
-      if (fs.existsSync(instrumentalPath)) {
-        instrumentalUrl = `${downloadsBase}/${jobId}/${encodeURIComponent('instrumental.mp3')}`;
+  if (twoStems) {
+    // 2-stem mode already produced the instrumental directly (no_vocals → instrumental.mp3)
+    const inst = stems.find((s) => s.name === 'instrumental');
+    if (inst) instrumentalUrl = `${downloadsBase}/${jobId}/${encodeURIComponent(inst.fileName)}`;
+  } else {
+    // 4-stem: build instrumental = drums + bass + other (no vocals) via ffmpeg amix
+    const nonVocal = stems.filter((s) => s.name !== 'vocals');
+    if (nonVocal.length >= 2) {
+      const inputs: string[] = [];
+      nonVocal.forEach((s) => {
+        inputs.push('-i', path.join(jobDir, s.fileName));
+      });
+      const instrumentalPath = path.join(jobDir, 'instrumental.mp3');
+      try {
+        await runCommand('ffmpeg', [
+          '-y',
+          ...inputs,
+          '-filter_complex', `amix=inputs=${nonVocal.length}:duration=longest:normalize=0`,
+          '-b:a', '256k',
+          instrumentalPath
+        ], { timeoutMs: 120000 });
+        if (fs.existsSync(instrumentalPath)) {
+          instrumentalUrl = `${downloadsBase}/${jobId}/${encodeURIComponent('instrumental.mp3')}`;
+        }
+      } catch (err) {
+        console.warn('[stems] instrumental mix failed:', err instanceof Error ? err.message.slice(0, 200) : err);
       }
-    } catch (err) {
-      console.warn('[stems] instrumental mix failed:', err instanceof Error ? err.message.slice(0, 200) : err);
     }
   }
 

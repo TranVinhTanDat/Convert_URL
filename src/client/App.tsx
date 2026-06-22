@@ -1708,12 +1708,14 @@ export function App() {
   const [labAudioResult, setLabAudioResult] = useState<TranscriptResult | null>(null);
   const [labAudioError, setLabAudioError] = useState('');
   const [labAudioLang, setLabAudioLang] = useState<string>('auto');
-  const [labAudioUseWhisper, setLabAudioUseWhisper] = useState(true);
+  const [labAudioUseWhisper, setLabAudioUseWhisper] = useState(false);
   const [labAudioView, setLabAudioView] = useState<'segments' | 'plain' | 'srt' | 'markdown'>('segments');
   const [labAudioCopiedField, setLabAudioCopiedField] = useState('');
   // Stems mode
   const [labStemsUrl, setLabStemsUrl] = useState('');
   const [labStemsModel, setLabStemsModel] = useState<'htdemucs' | 'htdemucs_ft' | 'mdx_extra'>('htdemucs');
+  const [labStemsTwoMode, setLabStemsTwoMode] = useState(false);
+  const [labStemsElapsed, setLabStemsElapsed] = useState(0);
   const [labStemsBusy, setLabStemsBusy] = useState(false);
   const [labStemsError, setLabStemsError] = useState('');
   const [labStemsResult, setLabStemsResult] = useState<StemsResult | null>(null);
@@ -1948,6 +1950,14 @@ export function App() {
   useEffect(() => {
     setRecentEntries(loadRecent());
   }, []);
+
+  // Elapsed timer while stems are processing (so the long demucs run shows progress).
+  useEffect(() => {
+    if (!labStemsBusy) { setLabStemsElapsed(0); return; }
+    const start = Date.now();
+    const t = setInterval(() => setLabStemsElapsed(Math.floor((Date.now() - start) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [labStemsBusy]);
 
   // Keep the header "Public" badge live regardless of which page is open.
   useEffect(() => {
@@ -2341,11 +2351,14 @@ export function App() {
     setLabStemsResult(null);
     stopAllStems();
     try {
-      const result = await separateStems({ url: labStemsUrl.trim(), model: labStemsModel });
+      const result = await separateStems({ url: labStemsUrl.trim(), model: labStemsModel, twoStems: labStemsTwoMode });
       setLabStemsResult(result);
       setLabStemsDuration(result.duration);
-      setLabStemsVolumes({ vocals: 100, drums: 100, bass: 100, other: 100 });
-      setLabStemsMuted({ vocals: false, drums: false, bass: false, other: false });
+      const vols: Record<string, number> = {};
+      const muted: Record<string, boolean> = {};
+      result.stems.forEach((s) => { vols[s.name] = 100; muted[s.name] = false; });
+      setLabStemsVolumes(vols);
+      setLabStemsMuted(muted);
       setLabStemsSolo(null);
       pushToast({ variant: 'success', title: 'Tách stems thành công', detail: `${result.stems.length} stems · ${result.durationLabel}` });
     } catch (err) {
@@ -2360,7 +2373,7 @@ export function App() {
   function getStemEffectiveVolume(stemName: string): number {
     if (labStemsMuted[stemName]) return 0;
     if (labStemsSolo && labStemsSolo !== stemName) return 0;
-    return labStemsVolumes[stemName] / 100;
+    return (labStemsVolumes[stemName] ?? 100) / 100;
   }
 
   function applyStemsVolumes() {
@@ -4535,12 +4548,11 @@ export function App() {
                     </div>
                   </div>
                   <div className="forge-audio-modes" role="tablist" aria-label="Mode">
-                    <button type="button" className={labAudioMode === 'lyrics' ? 'active' : ''} onClick={() => setLabAudioMode('lyrics')}>
+                    <button type="button" className={labAudioMode === 'lyrics' ? 'active' : ''} onClick={() => { setLabAudioMode('lyrics'); if (!labAudioUrl.trim() && labStemsUrl.trim()) setLabAudioUrl(labStemsUrl); }}>
                       <FileText size={12} /> Trích lời
                     </button>
-                    <button type="button" className={labAudioMode === 'stems' ? 'active' : ''} onClick={() => setLabAudioMode('stems')}>
-                      <Layers size={12} /> Tách stems
-                      <em className="forge-audio-mode-soon">SOON</em>
+                    <button type="button" className={labAudioMode === 'stems' ? 'active' : ''} onClick={() => { setLabAudioMode('stems'); if (!labStemsUrl.trim() && labAudioUrl.trim()) setLabStemsUrl(labAudioUrl); }}>
+                      <Layers size={12} /> Tách nhạc
                     </button>
                   </div>
                 </header>
@@ -4851,6 +4863,20 @@ export function App() {
                                   </button>
                                 ) : null}
                               </div>
+                              <div style={{ display: 'flex', gap: 8, margin: '12px 0' }}>
+                                <button type="button" onClick={() => setLabStemsTwoMode(false)}
+                                  style={{ flex: 1, padding: '10px', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: 13,
+                                    border: '1px solid ' + (!labStemsTwoMode ? '#0f9f8f' : 'rgba(127,127,127,.3)'),
+                                    background: !labStemsTwoMode ? 'rgba(15,159,143,.12)' : 'transparent', color: 'inherit' }}>
+                                  🎛️ 4 stems<br /><small style={{ opacity: 0.7, fontWeight: 400 }}>Vocals · Drums · Bass · Other</small>
+                                </button>
+                                <button type="button" onClick={() => setLabStemsTwoMode(true)}
+                                  style={{ flex: 1, padding: '10px', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: 13,
+                                    border: '1px solid ' + (labStemsTwoMode ? '#0f9f8f' : 'rgba(127,127,127,.3)'),
+                                    background: labStemsTwoMode ? 'rgba(15,159,143,.12)' : 'transparent', color: 'inherit' }}>
+                                  🎤 2 stems (Karaoke)<br /><small style={{ opacity: 0.7, fontWeight: 400 }}>Giọng + Nhạc nền · nhanh ~2x</small>
+                                </button>
+                              </div>
                               <div className="forge-stems-model-picker">
                                 <div className="forge-labws-section-title" style={{ marginBottom: 8 }}>Mô hình tách</div>
                                 <div className="forge-stems-models">
@@ -4886,9 +4912,9 @@ export function App() {
                                 onClick={runStemsSeparation}
                               >
                                 {labStemsBusy ? (
-                                  <><Loader2 size={15} className="forge-labws-spin" /> Đang tách stems (có thể mất vài phút)…</>
+                                  <><Loader2 size={15} className="forge-labws-spin" /> Đang tách… {labStemsElapsed > 0 ? `(${fmtTime(labStemsElapsed)})` : '(có thể vài phút)'}</>
                                 ) : (
-                                  <><Wand2 size={15} /> Tách 4 stems</>
+                                  <><Wand2 size={15} /> {labStemsTwoMode ? 'Tách Karaoke (2 stems)' : 'Tách 4 stems'}</>
                                 )}
                               </button>
 

@@ -136,7 +136,7 @@ export function detectObjects(file: File, model?: string): Promise<import('./typ
   return request<import('./types').DetectObjectsResult>('/api/detect-objects', { method: 'POST', body });
 }
 
-export function separateStems(payload: { url: string; model?: string }): Promise<StemsResult> {
+export function separateStems(payload: { url: string; model?: string; twoStems?: boolean }): Promise<StemsResult> {
   return request<StemsResult>('/api/audio/stems', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

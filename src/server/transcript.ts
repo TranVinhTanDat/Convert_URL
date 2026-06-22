@@ -606,12 +606,13 @@ export async function fetchTranscriptWithYtdlp(
     const whisperAvailable = await hasCommand('faster-whisper', ['--help']) || await hasCommand('whisper', ['--help']);
 
     const langPriority = languages.length ? languages : ['vi', 'en'];
-    // If user explicitly requested Whisper, skip the YouTube sub and go straight to Whisper.
-    // Otherwise prefer existing manual/auto subs (faster, no compute).
-    const picked = options.useWhisper ? null : pickFirstVttFile(jobDir, langPriority, true);
+    // Always detect downloaded subtitles so we can fall back to them if Whisper
+    // yields no speech (common on music videos / instrumental-heavy audio).
+    const subFile = pickFirstVttFile(jobDir, langPriority, true);
+    // If user requested Whisper, try it first; otherwise prefer existing subs (faster).
+    let picked = options.useWhisper ? null : subFile;
 
     if (!picked) {
-      // No subtitles found OR user forced Whisper — try Whisper fallback
       const whisperResult = await tryWhisperFallback({
         url,
         info,
@@ -621,25 +622,32 @@ export async function fetchTranscriptWithYtdlp(
         hasCommand,
         languages: langPriority
       });
-      if (whisperResult) return whisperResult;
+      if (whisperResult && whisperResult.segments.length > 0) return whisperResult;
 
-      return {
-        video: videoMeta,
-        language: '',
-        languageLabel: 'Không có',
-        source: 'none',
-        hasSubtitles: false,
-        availableLanguages,
-        segments: [],
-        qualityWarning: buildQualityWarning(detectedType, 'none', whisperAvailable),
-        plainText: '',
-        paragraphsMarkdown: '',
-        srt: '',
-        vtt: '',
-        message: whisperAvailable
-          ? 'Video này không có phụ đề (manual hoặc auto). Whisper đã chạy nhưng không có speech.'
-          : 'Video này không có phụ đề (manual hoặc auto). Cài Whisper local để transcribe fallback: python -m pip install faster-whisper-cli'
-      };
+      // Whisper unavailable or produced no speech — fall back to subtitles if present.
+      if (subFile) {
+        picked = subFile;
+      } else if (whisperResult) {
+        return whisperResult; // empty Whisper result carries its own message
+      } else {
+        return {
+          video: videoMeta,
+          language: '',
+          languageLabel: 'Không có',
+          source: 'none',
+          hasSubtitles: false,
+          availableLanguages,
+          segments: [],
+          qualityWarning: buildQualityWarning(detectedType, 'none', whisperAvailable),
+          plainText: '',
+          paragraphsMarkdown: '',
+          srt: '',
+          vtt: '',
+          message: whisperAvailable
+            ? 'Video này không có phụ đề (manual hoặc auto). Whisper đã chạy nhưng không có speech.'
+            : 'Video này không có phụ đề (manual hoặc auto). Cài Whisper local để transcribe fallback: python -m pip install faster-whisper-cli'
+        };
+      }
     }
 
     const vtt = fs.readFileSync(picked.path, 'utf8');

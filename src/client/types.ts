@@ -32,7 +32,7 @@ export interface HealthResponse {
 }
 
 export interface StemsStem {
-  name: 'vocals' | 'drums' | 'bass' | 'other';
+  name: 'vocals' | 'drums' | 'bass' | 'other' | 'instrumental';
   label: string;
   fileName: string;
   size: number;

@@ -3655,7 +3655,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/audio/stems') {
-      const body = await parseBody(req) as { url?: string; model?: string };
+      const body = await parseBody(req) as { url?: string; model?: string; twoStems?: boolean };
       const inputUrl = String(body.url || '').trim();
       if (!inputUrl) {
         sendJson(res, 400, { error: 'URL không được trống.' });
@@ -3688,6 +3688,7 @@ const server = http.createServer(async (req, res) => {
           jobId,
           downloadsBase: '/downloads',
           model,
+          twoStems: body.twoStems === true,
           runYtdlp: async (args, opts) => run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], opts),
           runCommand: async (command, args, opts) => run(command, args, opts || {}),
           hasCommand: (command, args) => hasCommand(command, args, 8000)
