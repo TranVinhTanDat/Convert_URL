@@ -144,6 +144,28 @@ export function separateStems(payload: { url: string; model?: string }): Promise
   });
 }
 
+export interface TunnelStatus {
+  running: boolean;
+  url: string | null;
+  startedAt: number | null;
+  targetPort: number;
+  recentLog: string[];
+  installed?: boolean;
+  error?: string;
+}
+
+export function getTunnelStatus(): Promise<TunnelStatus> {
+  return request<TunnelStatus>('/api/tunnel/status');
+}
+
+export function startTunnel(): Promise<TunnelStatus> {
+  return request<TunnelStatus>('/api/tunnel/start', { method: 'POST' });
+}
+
+export function stopTunnel(): Promise<TunnelStatus> {
+  return request<TunnelStatus>('/api/tunnel/stop', { method: 'POST' });
+}
+
 export interface VoiceCloneResult {
   id: string;
   status: string;

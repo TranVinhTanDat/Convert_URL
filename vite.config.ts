@@ -10,6 +10,9 @@ export default defineConfig({
     host: appConfig.host,
     port: appConfig.webPort,
     strictPort: true,
+    // Allow Cloudflare quick-tunnel hostnames so the in-app tunnel admin can expose
+    // the dev server publicly (Vite blocks unknown Host headers by default).
+    allowedHosts: ['.trycloudflare.com'],
     proxy: Object.fromEntries(appConfig.apiRoutes.map((route) => [route, getApiOrigin()]))
   },
   build: {

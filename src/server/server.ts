@@ -1896,6 +1896,102 @@ function resolveVixttsDir(): string | null {
   return fs.existsSync(path.join(dir, 'config.json')) && fs.existsSync(path.join(dir, 'model.pth')) ? dir : null;
 }
 
+// ===== Cloudflare quick-tunnel manager (local admin page) =====
+let tunnelProc: ReturnType<typeof spawn> | null = null;
+let tunnelUrl: string | null = null;
+let tunnelStartedAt: number | null = null;
+let tunnelLog: string[] = [];
+
+function resolveCloudflared(): string {
+  const env = String(process.env.CLOUDFLARED_PATH || '').trim();
+  const candidates = [
+    env,
+    'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
+    'C:\\Program Files\\cloudflared\\cloudflared.exe',
+    '/usr/local/bin/cloudflared',
+    '/usr/bin/cloudflared'
+  ].filter(Boolean);
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return 'cloudflared'; // fall back to PATH lookup
+}
+
+function tunnelTargetPort(): number {
+  return clampInt(process.env.TUNNEL_PORT, appConfig.webPort, 1, 65535);
+}
+
+function tunnelStatus() {
+  return {
+    running: Boolean(tunnelProc && !tunnelProc.killed),
+    url: tunnelUrl,
+    startedAt: tunnelStartedAt,
+    targetPort: tunnelTargetPort(),
+    recentLog: tunnelLog.slice(-10)
+  };
+}
+
+async function startTunnel(): Promise<void> {
+  if (tunnelProc && !tunnelProc.killed) return; // already running
+  const bin = resolveCloudflared();
+  const port = tunnelTargetPort();
+  tunnelUrl = null;
+  tunnelLog = [];
+
+  // Force HTTP/2 (TCP 443) instead of the default QUIC (UDP 7844). Many networks
+  // block/throttle QUIC, causing "control stream encountered a failure while serving"
+  // and endless retries — http2 is far more reliable. Override via TUNNEL_PROTOCOL.
+  const protocol = String(process.env.TUNNEL_PROTOCOL || 'http2').trim();
+  const proc = spawn(bin, ['tunnel', '--no-autoupdate', '--protocol', protocol, '--url', `http://localhost:${port}`], {
+    windowsHide: true
+  });
+  tunnelProc = proc;
+  tunnelStartedAt = Date.now();
+
+  const onData = (chunk: Buffer) => {
+    const text = chunk.toString('utf8');
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) tunnelLog.push(trimmed);
+    }
+    if (tunnelLog.length > 80) tunnelLog = tunnelLog.slice(-80);
+    const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+    if (match && !tunnelUrl) tunnelUrl = match[0];
+  };
+  proc.stdout?.on('data', onData);
+  proc.stderr?.on('data', onData);
+  proc.on('error', (err) => {
+    tunnelLog.push(`spawn error: ${err.message}`);
+    tunnelProc = null;
+  });
+  proc.on('exit', () => {
+    tunnelProc = null;
+    tunnelUrl = null;
+    tunnelStartedAt = null;
+  });
+
+  const start = Date.now();
+  while (!tunnelUrl && Date.now() - start < 25000) {
+    if (!tunnelProc) {
+      throw new Error('cloudflared thoát sớm — kiểm tra đã cài cloudflared chưa (winget install Cloudflare.cloudflared).');
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  if (!tunnelUrl) {
+    stopTunnel();
+    throw new Error('Không lấy được URL tunnel sau 25s. Thử lại hoặc xem log.');
+  }
+}
+
+function stopTunnel(): void {
+  if (tunnelProc && !tunnelProc.killed) {
+    tunnelProc.kill();
+  }
+  tunnelProc = null;
+  tunnelUrl = null;
+  tunnelStartedAt = null;
+}
+
 async function findPythonWithCv2(): Promise<string | null> {
   for (const candidate of ['python', 'python3', 'py']) {
     if (!(await hasCommand(candidate, ['--version']))) continue;
@@ -3145,25 +3241,66 @@ function concatFileLine(filePath: string) {
   return `file '${normalized}'`;
 }
 
-async function renderNewsVideo(slidePaths: string[], outputPath: string) {
+async function probeMediaDuration(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await run('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1', filePath
+    ], { timeoutMs: 8000 });
+    const n = parseFloat(stdout.trim());
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Synthesize the news voiceover to speech via the local XTTS engine (.venv-tts),
+// using the bundled narrator reference voice. Returns false (→ silent video) when
+// the engine isn't installed, or for Vietnamese without the viXTTS model.
+async function synthNewsNarration(text: string, lang: 'vi' | 'en', outPath: string): Promise<boolean> {
+  const ttsPython = resolveTtsPython();
+  const cloneScript = path.join(ROOT, 'scripts', 'voice_clone.py');
+  const refVoice = path.join(ROOT, 'data', 'news-voice-ref.wav');
+  if (!ttsPython || !fs.existsSync(cloneScript) || !fs.existsSync(refVoice)) return false;
+  const vixttsDir = resolveVixttsDir();
+  if (lang === 'vi' && !vixttsDir) return false;
+  const args = [cloneScript, refVoice, text.slice(0, 1200), outPath, '--lang', lang];
+  if (lang === 'vi' && vixttsDir) args.push('--model-dir', vixttsDir);
+  try {
+    await run(ttsPython, args, { timeoutMs: 8 * 60 * 1000, env: { ...process.env, COQUI_TOS_AGREED: '1' } });
+    return fs.existsSync(outPath) && fs.statSync(outPath).size > 200;
+  } catch (err) {
+    console.warn('[news-video] narration failed:', err instanceof Error ? err.message.slice(0, 200) : err);
+    return false;
+  }
+}
+
+async function renderNewsVideo(slidePaths: string[], outputPath: string, audioPath?: string) {
+  // With narration audio, sync slide durations to the voiceover length so the
+  // slideshow matches the speech; otherwise fall back to a fixed 4.2s per slide.
+  const hasAudio = Boolean(audioPath && fs.existsSync(audioPath));
+  let perSlide = 4.2;
+  if (hasAudio) {
+    const dur = await probeMediaDuration(audioPath!);
+    if (dur > 0) perSlide = Math.max(2.5, dur / slidePaths.length);
+  }
+
   const listPath = path.join(path.dirname(outputPath), 'slides.txt');
   const lines: string[] = [];
   for (const slidePath of slidePaths) {
     lines.push(concatFileLine(slidePath));
-    lines.push('duration 4.2');
+    lines.push(`duration ${perSlide.toFixed(2)}`);
   }
   lines.push(concatFileLine(slidePaths[slidePaths.length - 1]));
   fs.writeFileSync(listPath, lines.join('\n'), 'utf8');
 
-  await run('ffmpeg', [
-    '-y',
-    '-f', 'concat',
-    '-safe', '0',
-    '-i', listPath,
-    '-vf', 'fps=30,format=yuv420p',
-    '-movflags', '+faststart',
-    outputPath
-  ], { timeoutMs: 180000 });
+  const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath];
+  if (hasAudio) args.push('-i', audioPath!);
+  args.push('-vf', 'fps=30,format=yuv420p', '-movflags', '+faststart');
+  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '192k', '-shortest');
+  args.push(outputPath);
+
+  await run('ffmpeg', args, { timeoutMs: 240000 });
 }
 
 function normalizeNewsVideoRequest(body: Record<string, unknown>): NewsVideoRequest {
@@ -3192,8 +3329,13 @@ async function createNewsVideoDraft(body: Record<string, unknown>) {
     slidePaths.push(slidePath);
   }
 
+  // Synthesize the voiceover to speech (XTTS, local) and mux it into the video.
+  // Falls back to a silent slideshow if the TTS engine/voice isn't available.
+  const narrationPath = path.join(jobDir, 'news-narration.wav');
+  const hasNarration = await synthNewsNarration(storyboard.voiceover, request.language, narrationPath);
+
   const videoPath = path.join(jobDir, `news-video-${request.format}.mp4`);
-  await renderNewsVideo(slidePaths, videoPath);
+  await renderNewsVideo(slidePaths, videoPath, hasNarration ? narrationPath : undefined);
 
   const scriptPath = path.join(jobDir, 'news-script.txt');
   const draftPath = path.join(jobDir, 'news-draft.json');
@@ -3231,6 +3373,7 @@ async function createNewsVideoDraft(body: Record<string, unknown>) {
     },
     files: [
       fileToDownload(id, videoPath),
+      ...(hasNarration ? [fileToDownload(id, narrationPath)] : []),
       fileToDownload(id, slidePaths[0]),
       fileToDownload(id, scriptPath),
       fileToDownload(id, draftPath)
@@ -3630,6 +3773,30 @@ const server = http.createServer(async (req, res) => {
         console.error('[voice-clone] error:', raw.slice(0, 500));
         sendJson(res, 502, { error: raw.slice(0, 300) });
       }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/tunnel/status') {
+      const bin = resolveCloudflared();
+      const installed = bin !== 'cloudflared' ? true : await hasCommand('cloudflared', ['--version'], 5000);
+      sendJson(res, 200, { ...tunnelStatus(), installed });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/tunnel/start') {
+      try {
+        await startTunnel();
+        sendJson(res, 200, tunnelStatus());
+      } catch (error) {
+        const status = tunnelStatus();
+        sendJson(res, 502, { ...status, error: error instanceof Error ? error.message : 'Không mở được tunnel.' });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/tunnel/stop') {
+      stopTunnel();
+      sendJson(res, 200, tunnelStatus());
       return;
     }
 

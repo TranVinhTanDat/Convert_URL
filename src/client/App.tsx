@@ -20,6 +20,7 @@ import {
   FileType2,
   Film,
   Filter,
+  Globe,
   Code2,
   HelpCircle,
   History,
@@ -68,11 +69,15 @@ import {
   getJob,
   getNewsFeed,
   getPreview,
+  getTunnelStatus,
   refreshNews,
   rejectArticle,
   separateStems,
+  startTunnel,
+  stopTunnel,
   zipUrl
 } from './api';
+import type { TunnelStatus } from './api';
 import type {
   ConvertFile,
   ConvertJob,
@@ -93,7 +98,7 @@ import type {
   TranscriptResult
 } from './types';
 
-type ActiveTool = 'content' | 'media' | 'files' | 'transcript' | 'lab' | 'workflows' | 'library';
+type ActiveTool = 'content' | 'media' | 'files' | 'transcript' | 'lab' | 'workflows' | 'library' | 'cloudflare';
 type TranscriptView = 'plain' | 'timeline' | 'markdown' | 'srt';
 type FileGroupId = 'documents' | 'data' | 'images';
 
@@ -1515,6 +1520,28 @@ const workflowTemplates: WorkflowTemplate[] = [
 const RECENT_LIMIT = 12;
 const RECENT_STORAGE_KEY = 'convert-url:recent-v1';
 
+interface ToolPreset {
+  id: string;
+  name: string;
+  tool: FileToolId;
+  toolTitle: string;
+  options: Record<string, string | number>;
+  createdAt: number;
+}
+const PRESET_STORAGE_KEY = 'convert-url:presets-v1';
+function loadPresets(): ToolPreset[] {
+  try {
+    const raw = localStorage.getItem(PRESET_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+function savePresets(list: ToolPreset[]) {
+  try { localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(list.slice(0, 50))); } catch { /* ignore */ }
+}
+
 function loadRecent(): RecentEntry[] {
   try {
     const raw = localStorage.getItem(RECENT_STORAGE_KEY);
@@ -1705,6 +1732,13 @@ export function App() {
   const [labVcBusy, setLabVcBusy] = useState(false);
   const [labVcError, setLabVcError] = useState('');
   const [labVcResult, setLabVcResult] = useState<ConvertFile | null>(null);
+  // Cloudflare tunnel admin
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
+  const [tunnelBusy, setTunnelBusy] = useState(false);
+  const [tunnelCopied, setTunnelCopied] = useState(false);
+  // Tool presets (saved File Tools configs)
+  const [presets, setPresets] = useState<ToolPreset[]>(loadPresets());
+  const [presetName, setPresetName] = useState('');
   // Object removal (Inpaint) workspace
   const [labInpaintMode, setLabInpaintMode] = useState<'smart' | 'subject' | 'manual'>('smart');
   // Smart object detection (YOLOv8)
@@ -1915,9 +1949,28 @@ export function App() {
     setRecentEntries(loadRecent());
   }, []);
 
+  // Keep the header "Public" badge live regardless of which page is open.
+  useEffect(() => {
+    refreshTunnel();
+    const t = setInterval(refreshTunnel, 8000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     setOptionValues(defaultsForTool(selectedTool));
   }, [selectedTool]);
+
+  // Load Cloudflare tunnel status when the admin page opens; poll while URL pending.
+  useEffect(() => {
+    if (activeTool !== 'cloudflare') return;
+    refreshTunnel();
+    const t = setInterval(() => {
+      setTunnel((cur) => { if (cur && cur.running && !cur.url) refreshTunnel(); return cur; });
+    }, 2000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTool]);
 
   // Global keyboard: Ctrl/Cmd+K opens palette, Esc closes any open header menu
   useEffect(() => {
@@ -2103,6 +2156,38 @@ export function App() {
     }
   }
 
+  function saveCurrentPreset() {
+    const tool = fileTools.find((t) => t.id === selectedTool);
+    const name = presetName.trim() || `${tool?.title ?? selectedTool} ${new Date().toLocaleDateString('vi-VN')}`;
+    const preset: ToolPreset = {
+      id: `${Date.now()}`,
+      name,
+      tool: selectedTool,
+      toolTitle: tool?.title ?? selectedTool,
+      options: { ...optionValues },
+      createdAt: Date.now()
+    };
+    setPresets((cur) => {
+      const next = [preset, ...cur].slice(0, 50);
+      savePresets(next);
+      return next;
+    });
+    setPresetName('');
+    pushToast({ variant: 'success', title: 'Đã lưu preset', detail: name });
+  }
+  function applyPreset(preset: ToolPreset) {
+    openFileTool(preset.tool);
+    setOptionValues({ ...defaultsForTool(preset.tool), ...preset.options });
+    pushToast({ variant: 'success', title: 'Đã áp preset', detail: preset.name });
+  }
+  function deletePreset(id: string) {
+    setPresets((cur) => {
+      const next = cur.filter((p) => p.id !== id);
+      savePresets(next);
+      return next;
+    });
+  }
+
   function deleteRecent(jobId: string) {
     setRecentEntries((current) => {
       const next = current.filter((entry) => entry.jobId !== jobId);
@@ -2179,6 +2264,33 @@ export function App() {
       pushToast({ variant: 'error', title: 'Nhân bản giọng thất bại', detail: msg });
     } finally {
       setLabVcBusy(false);
+    }
+  }
+
+  async function refreshTunnel() {
+    try { setTunnel(await getTunnelStatus()); } catch { /* ignore */ }
+  }
+  async function doStartTunnel() {
+    setTunnelBusy(true);
+    try {
+      const st = await startTunnel();
+      setTunnel(st);
+      pushToast({ variant: 'success', title: 'Đã mở tunnel', detail: st.url || 'Đang chờ URL…' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Mở tunnel thất bại';
+      pushToast({ variant: 'error', title: 'Tunnel thất bại', detail: msg });
+      await refreshTunnel();
+    } finally {
+      setTunnelBusy(false);
+    }
+  }
+  async function doStopTunnel() {
+    setTunnelBusy(true);
+    try {
+      setTunnel(await stopTunnel());
+      pushToast({ variant: 'info', title: 'Đã tắt tunnel', detail: 'URL public không còn hiệu lực.' });
+    } catch { /* ignore */ } finally {
+      setTunnelBusy(false);
     }
   }
 
@@ -3292,6 +3404,11 @@ export function App() {
             <span>Library</span>
             {recentEntries.length > 0 ? <em className="forge-nav-badge forge-nav-badge-count">{recentEntries.length}</em> : null}
           </button>
+          <button type="button" className={`forge-nav-item ${activeTool === 'cloudflare' ? 'active' : ''}`} onClick={() => setActiveTool('cloudflare')}>
+            <Globe size={17} />
+            <span>Cloudflare</span>
+            {tunnel?.running ? <em className="forge-nav-badge forge-nav-badge-count" style={{ background: '#16a34a' }}>●</em> : null}
+          </button>
         </nav>
 
         <div className="forge-usage">
@@ -3313,7 +3430,7 @@ export function App() {
           <div className="forge-breadcrumb">
             <strong>Forge Studio</strong>
             <Clock size={11} />
-            <span>{activeTool === 'media' ? 'Media URL' : activeTool === 'files' ? 'File Tools' : activeTool === 'transcript' ? 'Transcript' : activeTool === 'lab' ? 'AI Lab' : activeTool === 'workflows' ? 'Workflows' : activeTool === 'library' ? 'Library' : 'Dashboard'}</span>
+            <span>{activeTool === 'media' ? 'Media URL' : activeTool === 'files' ? 'File Tools' : activeTool === 'transcript' ? 'Transcript' : activeTool === 'lab' ? 'AI Lab' : activeTool === 'workflows' ? 'Workflows' : activeTool === 'library' ? 'Library' : activeTool === 'cloudflare' ? 'Cloudflare' : 'Dashboard'}</span>
           </div>
 
           <button type="button" className="forge-cmdk" onClick={() => toggleHeaderMenu('cmd')}>
@@ -3323,6 +3440,21 @@ export function App() {
           </button>
 
           <div className="forge-topbar-actions">
+            <button
+              type="button"
+              onClick={() => setActiveTool('cloudflare')}
+              title={tunnel?.running ? `Tunnel đang chạy: ${tunnel.url ?? 'đang lấy URL'}` : 'Mở/quản lý Cloudflare tunnel'}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 7, padding: '7px 13px', borderRadius: 999,
+                border: '1px solid ' + (tunnel?.running ? 'rgba(22,163,74,.5)' : 'rgba(127,127,127,.3)'),
+                background: tunnel?.running ? 'rgba(22,163,74,.12)' : 'transparent',
+                color: 'inherit', cursor: 'pointer', fontWeight: 600, fontSize: 13
+              }}
+            >
+              <Globe size={15} />
+              <span>Public</span>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: tunnel?.running ? '#16a34a' : '#9ca3af', display: 'inline-block' }} />
+            </button>
             <button
               type="button"
               className={`forge-icon-btn ${headerMenu === 'notif' ? 'is-open' : ''}`}
@@ -6706,10 +6838,42 @@ export function App() {
                       <span>Tính năng share link đang được phát triển. Sắp có trong bản tới.</span>
                     </div>
                   ) : libTab === 'presets' ? (
-                    <div className="forge-libv2-empty">
-                      <Workflow size={36} />
-                      <strong>Quản lý preset</strong>
-                      <span>Lưu cấu hình tool yêu thích để dùng lại nhanh — sắp ra mắt.</span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: 4 }}>
+                      <div style={{ padding: 16, border: '1px solid rgba(127,127,127,.2)', borderRadius: 12 }}>
+                        <div className="forge-field-label" style={{ marginBottom: 8 }}>Lưu cấu hình File Tools hiện tại</div>
+                        <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 10 }}>
+                          Tool đang chọn: <strong>{fileTools.find((t) => t.id === selectedTool)?.title ?? selectedTool}</strong>
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                          <input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="Tên preset (vd: WebP 1920 chất lượng cao)"
+                            style={{ flex: 1, minWidth: 240, padding: '9px 12px', borderRadius: 8, border: '1px solid rgba(127,127,127,.3)' }} />
+                          <button type="button" onClick={saveCurrentPreset}
+                            style={{ padding: '9px 16px', borderRadius: 8, border: 'none', background: '#0f9f8f', color: '#fff', fontWeight: 600, cursor: 'pointer' }}>💾 Lưu preset</button>
+                        </div>
+                      </div>
+                      {presets.length === 0 ? (
+                        <div className="forge-libv2-empty">
+                          <Workflow size={36} />
+                          <strong>Chưa có preset</strong>
+                          <span>Chọn tool + tuỳ chọn ở File Tools rồi quay lại đây lưu để tái dùng nhanh.</span>
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                          {presets.map((p) => (
+                            <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 14px', border: '1px solid rgba(127,127,127,.2)', borderRadius: 10 }}>
+                              <div style={{ minWidth: 0 }}>
+                                <strong style={{ display: 'block' }}>{p.name}</strong>
+                                <small style={{ opacity: 0.65 }}>{p.toolTitle} · {Object.keys(p.options).length} tuỳ chọn</small>
+                              </div>
+                              <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                                <button type="button" onClick={() => applyPreset(p)}
+                                  style={{ padding: '7px 14px', borderRadius: 8, border: '1px solid #0f9f8f', background: 'transparent', color: '#0f9f8f', fontWeight: 600, cursor: 'pointer' }}>Áp dụng</button>
+                                <button type="button" onClick={() => deletePreset(p.id)} title="Xoá" className="forge-icon-btn"><Trash2 size={15} /></button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ) : recentEntries.length === 0 ? (
                     <div className="forge-libv2-empty">
@@ -6807,6 +6971,75 @@ export function App() {
             </section>
           );
         })()
+
+      ) : activeTool === 'cloudflare' ? (
+        <section className="forge-files-section">
+          <div className="forge-media-hero" style={{ marginBottom: 24 }}>
+            <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}><Globe size={22} /> Cloudflare Tunnel</h1>
+            <p>Mở app ra Internet bằng 1 URL công khai miễn phí (chạy qua máy của bạn). Tắt là URL hết hiệu lực ngay.</p>
+          </div>
+
+          {tunnel && tunnel.installed === false ? (
+            <div className="forge-audio-empty" style={{ marginBottom: 16 }}>
+              ⚠️ Chưa cài <code>cloudflared</code> trên máy. Cài bằng: <code>winget install Cloudflare.cloudflared</code> rồi tải lại trang.
+            </div>
+          ) : null}
+
+          <div style={{ maxWidth: 760, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ padding: 18, border: '1px solid rgba(127,127,127,.25)', borderRadius: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span style={{ width: 11, height: 11, borderRadius: '50%', background: tunnel?.running ? '#16a34a' : '#9ca3af', display: 'inline-block' }} />
+                  <strong>{tunnel?.running ? 'Đang chạy' : 'Đã tắt'}</strong>
+                  <small style={{ opacity: 0.6 }}>cổng nội bộ: {tunnel?.targetPort ?? '—'}</small>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {tunnel?.running ? (
+                    <button type="button" disabled={tunnelBusy} onClick={doStopTunnel}
+                      style={{ padding: '9px 16px', borderRadius: 8, border: '1px solid #ef4444', background: 'transparent', color: '#ef4444', cursor: 'pointer', fontWeight: 600 }}>
+                      Tắt tunnel
+                    </button>
+                  ) : (
+                    <button type="button" disabled={tunnelBusy} onClick={doStartTunnel}
+                      style={{ padding: '9px 18px', borderRadius: 8, border: 'none', background: '#0f9f8f', color: '#fff', cursor: tunnelBusy ? 'wait' : 'pointer', fontWeight: 600 }}>
+                      {tunnelBusy ? '⏳ Đang mở…' : '🌐 Mở public URL'}
+                    </button>
+                  )}
+                  <button type="button" className="forge-icon-btn" onClick={refreshTunnel} disabled={tunnelBusy} title="Làm mới"><RefreshCw size={15} /></button>
+                </div>
+              </div>
+
+              {tunnel?.running && tunnel.url ? (
+                <div style={{ marginTop: 16 }}>
+                  <div className="forge-field-label" style={{ marginBottom: 6 }}>URL công khai</div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <input readOnly value={tunnel.url} onFocus={(e) => e.currentTarget.select()}
+                      style={{ flex: 1, minWidth: 260, padding: '10px 12px', borderRadius: 8, border: '1px solid rgba(127,127,127,.3)', fontFamily: 'monospace', fontSize: 13 }} />
+                    <button type="button" onClick={async () => { try { await navigator.clipboard.writeText(tunnel.url!); setTunnelCopied(true); setTimeout(() => setTunnelCopied(false), 1500); } catch { /* ignore */ } }}
+                      style={{ padding: '9px 14px', borderRadius: 8, border: '1px solid rgba(127,127,127,.3)', background: 'transparent', cursor: 'pointer', fontWeight: 600 }}>
+                      {tunnelCopied ? '✓ Đã copy' : 'Copy'}
+                    </button>
+                    <a href={tunnel.url} target="_blank" rel="noreferrer"
+                      style={{ padding: '9px 16px', borderRadius: 8, background: '#0f9f8f', color: '#fff', textDecoration: 'none', fontWeight: 600 }}>Mở ↗</a>
+                  </div>
+                </div>
+              ) : tunnel?.running && !tunnel.url ? (
+                <div style={{ marginTop: 14, opacity: 0.7 }}>Đang chờ Cloudflare cấp URL…</div>
+              ) : null}
+            </div>
+
+            <div className="forge-audio-empty">
+              ℹ️ URL đổi mỗi lần mở (Quick Tunnel). Chỉ online khi máy bạn bật + app đang chạy. Ai có link đều dùng được — đừng chia sẻ nếu không muốn người khác xài tài nguyên máy bạn.
+            </div>
+
+            {tunnel?.recentLog?.length ? (
+              <details>
+                <summary style={{ cursor: 'pointer', opacity: 0.7 }}>Log cloudflared</summary>
+                <pre style={{ maxHeight: 200, overflow: 'auto', fontSize: 11, background: '#0b0b0b', color: '#ddd', padding: 12, borderRadius: 8, marginTop: 8 }}>{tunnel.recentLog.join('\n')}</pre>
+              </details>
+            ) : null}
+          </div>
+        </section>
 
       ) : (
         <section className="forge-files-section">
