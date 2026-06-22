@@ -42,6 +42,8 @@ interface StemsRunOptions {
   downloadsBase: string;
   model?: 'htdemucs' | 'htdemucs_ft' | 'mdx_extra' | 'spleeter:4stems';
   twoStems?: boolean; // karaoke mode: vocals + instrumental only (≈2x faster)
+  audioPath?: string; // local uploaded audio file (skip yt-dlp download when set)
+  title?: string;     // display title for uploaded audio
   runYtdlp: (args: string[], options: { timeoutMs: number }) => Promise<{ stdout: string }>;
   runCommand: (command: string, args: string[], options?: { timeoutMs?: number; env?: Record<string, string> }) => Promise<{ stdout: string; stderr: string }>;
   hasCommand: (command: string, args: string[]) => Promise<boolean>;
@@ -111,35 +113,47 @@ export async function separateStems(options: StemsRunOptions): Promise<StemsResu
     throw err;
   }
 
-  // 2) Fetch video meta
-  const meta = await fetchVideoInfo(url, runYtdlp);
-  if (meta.duration > 600) {
-    throw new Error(`Audio dài ${formatDurationLabel(meta.duration)} — vượt giới hạn 10 phút để tách stems (Demucs CPU rất chậm). Cắt audio ngắn lại bằng tool khác trước.`);
-  }
+  // 2 + 3) Resolve the source audio: either an uploaded local file, or download from URL.
+  let meta: { title: string; duration: number; thumbnail: string | null };
+  let audioPath: string;
+  let duration: number;
 
-  // 3) Download audio as WAV (Demucs prefers WAV input)
-  const audioId = `src-${jobId.slice(0, 8)}`;
-  const beforeFiles = new Set(fs.readdirSync(jobDir));
-  await runYtdlp([
-    '-x',
-    '--audio-format', 'wav',
-    '--audio-quality', '0',
-    '--no-playlist',
-    '--no-warnings',
-    '--paths', jobDir,
-    '-o', `${audioId}.%(ext)s`,
-    url
-  ], { timeoutMs: 240000 });
+  if (options.audioPath) {
+    // Uploaded file path — skip yt-dlp entirely.
+    audioPath = options.audioPath;
+    duration = await probeAudioDuration(audioPath, runCommand);
+    if (duration > 600) {
+      throw new Error(`Audio dài ${formatDurationLabel(duration)} — vượt giới hạn 10 phút để tách stems (Demucs CPU rất chậm).`);
+    }
+    meta = { title: options.title || 'Audio upload', duration, thumbnail: null };
+  } else {
+    meta = await fetchVideoInfo(url, runYtdlp);
+    if (meta.duration > 600) {
+      throw new Error(`Audio dài ${formatDurationLabel(meta.duration)} — vượt giới hạn 10 phút để tách stems (Demucs CPU rất chậm). Cắt audio ngắn lại bằng tool khác trước.`);
+    }
+    const audioId = `src-${jobId.slice(0, 8)}`;
+    const beforeFiles = new Set(fs.readdirSync(jobDir));
+    await runYtdlp([
+      '-x',
+      '--audio-format', 'wav',
+      '--audio-quality', '0',
+      '--no-playlist',
+      '--no-warnings',
+      '--paths', jobDir,
+      '-o', `${audioId}.%(ext)s`,
+      url
+    ], { timeoutMs: 240000 });
 
-  const afterFiles = fs.readdirSync(jobDir);
-  const audioFile = afterFiles.find((f) =>
-    !beforeFiles.has(f) && /\.(wav|mp3|m4a|webm|opus)$/i.test(f)
-  );
-  if (!audioFile) {
-    throw new Error('Không tải được audio từ URL. Thử URL khác.');
+    const afterFiles = fs.readdirSync(jobDir);
+    const audioFile = afterFiles.find((f) =>
+      !beforeFiles.has(f) && /\.(wav|mp3|m4a|webm|opus)$/i.test(f)
+    );
+    if (!audioFile) {
+      throw new Error('Không tải được audio từ URL. Thử URL khác.');
+    }
+    audioPath = path.join(jobDir, audioFile);
+    duration = meta.duration > 0 ? meta.duration : await probeAudioDuration(audioPath, runCommand);
   }
-  const audioPath = path.join(jobDir, audioFile);
-  const duration = meta.duration > 0 ? meta.duration : await probeAudioDuration(audioPath, runCommand);
 
   // 4) Run Demucs (CPU mode — slower but works without GPU)
   // demucs -n <model> --out <dir> --mp3 --device cpu <input>

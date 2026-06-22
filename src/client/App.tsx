@@ -73,6 +73,7 @@ import {
   refreshNews,
   rejectArticle,
   separateStems,
+  separateStemsUpload,
   startTunnel,
   stopTunnel,
   zipUrl
@@ -1716,6 +1717,8 @@ export function App() {
   const [labStemsModel, setLabStemsModel] = useState<'htdemucs' | 'htdemucs_ft' | 'mdx_extra'>('htdemucs');
   const [labStemsTwoMode, setLabStemsTwoMode] = useState(false);
   const [labStemsElapsed, setLabStemsElapsed] = useState(0);
+  const [labStemsFile, setLabStemsFile] = useState<File | null>(null);
+  const [labStemsSpeed, setLabStemsSpeed] = useState(1);
   const [labStemsBusy, setLabStemsBusy] = useState(false);
   const [labStemsError, setLabStemsError] = useState('');
   const [labStemsResult, setLabStemsResult] = useState<StemsResult | null>(null);
@@ -1950,6 +1953,11 @@ export function App() {
   useEffect(() => {
     setRecentEntries(loadRecent());
   }, []);
+
+  // Apply playback speed to all stem audio tracks (karaoke practice).
+  useEffect(() => {
+    Object.values(labStemsAudioRefs.current).forEach((a) => { if (a) a.playbackRate = labStemsSpeed; });
+  }, [labStemsSpeed, labStemsResult, labStemsPlaying]);
 
   // Elapsed timer while stems are processing (so the long demucs run shows progress).
   useEffect(() => {
@@ -2342,8 +2350,8 @@ export function App() {
 
   // ============ Stems mode functions ============
   async function runStemsSeparation() {
-    if (!labStemsUrl.trim()) {
-      setLabStemsError('Cần URL audio để tách stems');
+    if (!labStemsFile && !labStemsUrl.trim()) {
+      setLabStemsError('Cần URL hoặc upload file audio để tách stems');
       return;
     }
     setLabStemsBusy(true);
@@ -2351,7 +2359,9 @@ export function App() {
     setLabStemsResult(null);
     stopAllStems();
     try {
-      const result = await separateStems({ url: labStemsUrl.trim(), model: labStemsModel, twoStems: labStemsTwoMode });
+      const result = labStemsFile
+        ? await separateStemsUpload(labStemsFile, labStemsModel, labStemsTwoMode)
+        : await separateStems({ url: labStemsUrl.trim(), model: labStemsModel, twoStems: labStemsTwoMode });
       setLabStemsResult(result);
       setLabStemsDuration(result.duration);
       const vols: Record<string, number> = {};
@@ -4854,13 +4864,24 @@ export function App() {
                                   type="url"
                                   placeholder="https://www.youtube.com/watch?v=..."
                                   value={labStemsUrl}
-                                  onChange={(e) => setLabStemsUrl(e.target.value)}
+                                  onChange={(e) => { setLabStemsUrl(e.target.value); if (e.target.value.trim()) setLabStemsFile(null); }}
                                   onKeyDown={(e) => { if (e.key === 'Enter' && labStemsUrl.trim() && !labStemsBusy) runStemsSeparation(); }}
                                 />
                                 {labStemsUrl ? (
                                   <button type="button" className="forge-audio-input-clear" onClick={() => setLabStemsUrl('')} aria-label="Clear">
                                     <XCircle size={13} />
                                   </button>
+                                ) : null}
+                              </div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '10px 0', fontSize: 13 }}>
+                                <span style={{ opacity: 0.5 }}>— hoặc —</span>
+                                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 12px', borderRadius: 8, border: '1px dashed rgba(127,127,127,.4)', cursor: 'pointer' }}>
+                                  <UploadCloud size={14} /> {labStemsFile ? labStemsFile.name.slice(0, 32) : 'Upload file audio (MP3/WAV…)'}
+                                  <input type="file" accept="audio/*,video/*" style={{ display: 'none' }}
+                                    onChange={(e) => { const f = e.target.files?.[0]; if (f) { setLabStemsFile(f); setLabStemsUrl(''); setLabStemsError(''); } }} />
+                                </label>
+                                {labStemsFile ? (
+                                  <button type="button" className="forge-audio-input-clear" onClick={() => setLabStemsFile(null)} aria-label="Clear file"><XCircle size={13} /></button>
                                 ) : null}
                               </div>
                               <div style={{ display: 'flex', gap: 8, margin: '12px 0' }}>
@@ -4908,7 +4929,7 @@ export function App() {
                               <button
                                 type="button"
                                 className="forge-stems-process"
-                                disabled={!labStemsUrl.trim() || labStemsBusy}
+                                disabled={(!labStemsUrl.trim() && !labStemsFile) || labStemsBusy}
                                 onClick={runStemsSeparation}
                               >
                                 {labStemsBusy ? (
@@ -4986,6 +5007,20 @@ export function App() {
                                     value={labStemsCurrentTime}
                                     onChange={(e) => seekStems(Number(e.target.value))}
                                   />
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 8 }} title="Tốc độ phát (luyện hát)">
+                                    {[0.75, 1, 1.25].map((sp) => (
+                                      <button key={sp} type="button" onClick={() => setLabStemsSpeed(sp)}
+                                        style={{ padding: '4px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                                          border: '1px solid ' + (labStemsSpeed === sp ? '#0f9f8f' : 'rgba(127,127,127,.3)'),
+                                          background: labStemsSpeed === sp ? 'rgba(15,159,143,.15)' : 'transparent', color: 'inherit' }}>
+                                        {sp}×
+                                      </button>
+                                    ))}
+                                  </div>
+                                  <a
+                                    href={zipUrl(sr.jobId, [...sr.stems.map((s: StemsStem) => s.fileName), ...(sr.instrumentalUrl && !sr.stems.some((s: StemsStem) => s.name === 'instrumental') ? ['instrumental.mp3'] : [])])}
+                                    style={{ marginLeft: 8, padding: '6px 12px', borderRadius: 8, background: '#0f9f8f', color: '#fff', textDecoration: 'none', fontSize: 12, fontWeight: 600 }}
+                                  >⬇ Tải tất cả (ZIP)</a>
                                 </div>
                               </div>
                               <button
@@ -4995,6 +5030,8 @@ export function App() {
                                   stopAllStems();
                                   setLabStemsResult(null);
                                   setLabStemsUrl('');
+                                  setLabStemsFile(null);
+                                  setLabStemsSpeed(1);
                                 }}
                               >
                                 <UploadCloud size={12} /> Bài mới

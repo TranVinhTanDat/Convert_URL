@@ -3704,6 +3704,45 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/audio/stems-upload') {
+      const upload = await parseMultipartUpload(req, { validateTool: false });
+      const cleanup = () => fs.rmSync(upload.jobDir, { recursive: true, force: true });
+      if (!upload.files.length) {
+        cleanup();
+        sendJson(res, 400, { error: 'Cần upload 1 file audio để tách stems.' });
+        return;
+      }
+      const allowedModels = ['htdemucs', 'htdemucs_ft', 'mdx_extra'] as const;
+      type ModelName = typeof allowedModels[number];
+      const requestedModel = String(upload.options.model || 'htdemucs') as ModelName;
+      const model: ModelName = allowedModels.includes(requestedModel) ? requestedModel : 'htdemucs';
+      try {
+        const ytdlpRunner = await resolveYtdlpRunner();
+        const result: StemsResult = await separateStems({
+          url: '',
+          jobDir: upload.jobDir,
+          jobId: upload.id,
+          downloadsBase: '/downloads',
+          model,
+          twoStems: upload.options.twoStems === true || String(upload.options.twoStems) === 'true',
+          audioPath: upload.files[0].filePath,
+          title: upload.files[0].originalName,
+          runYtdlp: async (args, opts) => run(ytdlpRunner.command, [...ytdlpRunner.argsPrefix, ...args], opts),
+          runCommand: async (command, args, opts) => run(command, args, opts || {}),
+          hasCommand: (command, args) => hasCommand(command, args, 8000)
+        });
+        sendJson(res, 200, result);
+      } catch (error) {
+        cleanup();
+        const raw = error instanceof Error ? error.message : 'Tách stems thất bại.';
+        const code = (error as { code?: string })?.code;
+        const status = code === 'DEMUCS_NOT_INSTALLED' ? 503 : 502;
+        console.error('[stems-upload] error:', raw.slice(0, 500));
+        sendJson(res, status, { error: raw.slice(0, 300), code });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/voice-clone') {
       const upload = await parseMultipartUpload(req, { validateTool: false });
       const cleanup = () => fs.rmSync(upload.jobDir, { recursive: true, force: true });

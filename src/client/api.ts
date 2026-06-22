@@ -144,6 +144,14 @@ export function separateStems(payload: { url: string; model?: string; twoStems?:
   });
 }
 
+export function separateStemsUpload(file: File, model?: string, twoStems?: boolean): Promise<StemsResult> {
+  const body = new FormData();
+  body.append('tool', 'stems-upload');
+  body.append('options', JSON.stringify({ model, twoStems }));
+  body.append('file', file, file.name);
+  return request<StemsResult>('/api/audio/stems-upload', { method: 'POST', body });
+}
+
 export interface TunnelStatus {
   running: boolean;
   url: string | null;
